@@ -1,10 +1,9 @@
-//crosschain/contracts/stellar/stellar-htlc/contracts/htlc/src/test.rs
 #![cfg(test)]
 
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation, Ledger, LedgerInfo},
-    token::{TokenClient}, Address, Bytes, BytesN, Env, String,
+    token, Address, Asset, BytesN, Env,
 };
 
 const AMOUNT: i128 = 1_000_000_000; // 100 XLM (7 decimals)
@@ -20,17 +19,16 @@ fn create_test_env() -> (Env, Address, Address, Address, Address) {
     let receiver = Address::generate(&env);
     let contract_addr = env.register_contract(None, HTLCContract);
 
-    // Get native XLM token address  
-    let addr_str = String::from_str(&env, "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQAHRBBI6ZFO");
-    let native_token_addr = Address::from_string(&addr_str);
+    // Get native XLM token address
+    let native_token_addr = env.deployer().with_stellar_asset(&Asset::Native).address();
 
     // Initialize native token with sufficient balance for sender
-    let native_token = TokenClient::new(&env, &native_token_addr);
+    let native_token = token::Client::new(&env, &native_token_addr);
     native_token.mock_all_auths();
 
     // Mint tokens to sender for testing
     let total_supply = 10_000_000_000_000; // Large supply for testing
-    native_token.mock_mint(&sender, &total_supply);
+    native_token.mint(&sender, &total_supply);
 
     (env, sender, receiver, contract_addr, native_token_addr)
 }
@@ -38,8 +36,7 @@ fn create_test_env() -> (Env, Address, Address, Address, Address) {
 fn create_test_hashlock() -> (BytesN<32>, BytesN<32>) {
     let env = Env::default();
     let preimage = BytesN::from_array(&env, &[42u8; 32]);
-    let preimage_bytes: Bytes = preimage.clone().into();
-    let hashlock = env.crypto().sha256(&preimage_bytes).into();
+    let hashlock = env.crypto().sha256(&preimage);
     (hashlock, preimage)
 }
 
@@ -92,7 +89,7 @@ fn test_withdraw_success() {
     );
 
     // Get initial balances
-    let native_token = TokenClient::new(&env, &native_token_addr);
+    let native_token = token::Client::new(&env, &native_token_addr);
     let receiver_balance_before = native_token.balance(&receiver);
     let sender_balance_before = native_token.balance(&sender);
 
@@ -128,7 +125,7 @@ fn test_refund_success() {
     );
 
     // Get initial sender balance
-    let native_token = TokenClient::new(&env, &native_token_addr);
+    let native_token = token::Client::new(&env, &native_token_addr);
     let sender_balance_before = native_token.balance(&sender);
 
     // Fast forward past timelock
@@ -152,7 +149,7 @@ fn test_refund_success() {
 }
 
 #[test]
-#[should_panic(expected = "Invalid amount")]
+#[should_panic(expected = "InvalidAmount")]
 fn test_create_htlc_invalid_amount_zero() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -170,7 +167,7 @@ fn test_create_htlc_invalid_amount_zero() {
 }
 
 #[test]
-#[should_panic(expected = "Invalid amount")]
+#[should_panic(expected = "InvalidAmount")]
 fn test_create_htlc_invalid_amount_negative() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -188,7 +185,7 @@ fn test_create_htlc_invalid_amount_negative() {
 }
 
 #[test]
-#[should_panic(expected = "Invalid safety deposit")]
+#[should_panic(expected = "InvalidAmount")]
 fn test_create_htlc_invalid_safety_deposit() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -206,7 +203,7 @@ fn test_create_htlc_invalid_safety_deposit() {
 }
 
 #[test]
-#[should_panic(expected = "Invalid timelock")]
+#[should_panic(expected = "InvalidTimelock")]
 fn test_create_htlc_past_timelock() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -224,7 +221,7 @@ fn test_create_htlc_past_timelock() {
 }
 
 #[test]
-#[should_panic(expected = "Contract already exists")]
+#[should_panic(expected = "ContractAlreadyExists")]
 fn test_create_htlc_duplicate() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -253,7 +250,7 @@ fn test_create_htlc_duplicate() {
 }
 
 #[test]
-#[should_panic(expected = "Invalid preimage")]
+#[should_panic(expected = "InvalidPreimage")]
 fn test_withdraw_wrong_preimage() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -276,7 +273,7 @@ fn test_withdraw_wrong_preimage() {
 }
 
 #[test]
-#[should_panic(expected = "Timelock expired")]
+#[should_panic(expected = "TimelockExpired")]
 fn test_withdraw_after_timelock() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -303,7 +300,7 @@ fn test_withdraw_after_timelock() {
 }
 
 #[test]
-#[should_panic(expected = "Timelock not expired")]
+#[should_panic(expected = "TimelockNotExpired")]
 fn test_refund_before_timelock() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -325,7 +322,7 @@ fn test_refund_before_timelock() {
 }
 
 #[test]
-#[should_panic(expected = "Already withdrawn")]
+#[should_panic(expected = "AlreadyWithdrawn")]
 fn test_double_withdraw() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -350,7 +347,7 @@ fn test_double_withdraw() {
 }
 
 #[test]
-#[should_panic(expected = "Already refunded")]
+#[should_panic(expected = "AlreadyRefunded")]
 fn test_double_refund() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -380,7 +377,7 @@ fn test_double_refund() {
 }
 
 #[test]
-#[should_panic(expected = "Already withdrawn")]
+#[should_panic(expected = "AlreadyWithdrawn")]
 fn test_refund_after_withdraw() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -410,7 +407,7 @@ fn test_refund_after_withdraw() {
 }
 
 #[test]
-#[should_panic(expected = "Already refunded")]
+#[should_panic(expected = "AlreadyRefunded")]
 fn test_withdraw_after_refund() {
     let (env, sender, receiver, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -440,7 +437,7 @@ fn test_withdraw_after_refund() {
 }
 
 #[test]
-#[should_panic(expected = "Contract not found")]
+#[should_panic(expected = "ContractNotFound")]
 fn test_get_htlc_nonexistent() {
     let (env, _, _, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -450,7 +447,7 @@ fn test_get_htlc_nonexistent() {
 }
 
 #[test]
-#[should_panic(expected = "Contract not found")]
+#[should_panic(expected = "ContractNotFound")]
 fn test_withdraw_nonexistent() {
     let (env, _, _, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -461,7 +458,7 @@ fn test_withdraw_nonexistent() {
 }
 
 #[test]
-#[should_panic(expected = "Contract not found")]
+#[should_panic(expected = "ContractNotFound")]
 fn test_refund_nonexistent() {
     let (env, _, _, contract_addr, _) = create_test_env();
     let client = HTLCContractClient::new(&env, &contract_addr);
@@ -506,7 +503,7 @@ fn test_zero_safety_deposit() {
         &sender, &receiver, &AMOUNT, &hashlock, &timelock, &0, // Zero safety deposit
     );
 
-    let native_token = TokenClient::new(&env, &native_token_addr);
+    let native_token = token::Client::new(&env, &native_token_addr);
     let receiver_balance_before = native_token.balance(&receiver);
     let sender_balance_before = native_token.balance(&sender);
 
@@ -532,8 +529,8 @@ fn test_large_amounts() {
     let large_safety_deposit = 100_000_000_000_000i128;
 
     // Ensure sender has enough balance
-    let native_token = TokenClient::new(&env, &native_token_addr);
-    native_token.mock_mint(
+    let native_token = token::Client::new(&env, &native_token_addr);
+    native_token.mint(
         &sender,
         &(large_amount + large_safety_deposit + 1_000_000_000_000),
     );
@@ -616,8 +613,7 @@ fn test_native_token_integration() {
     let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
 
     // Verify we're using native XLM token
-    let addr_str = String::from_str(&env, "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQAHRBBI6ZFO");
-    let expected_native_addr = Address::from_string(&addr_str);
+    let expected_native_addr = env.deployer().with_stellar_asset(&Asset::Native).address();
     assert_eq!(native_token_addr, expected_native_addr);
 
     // Create HTLC
