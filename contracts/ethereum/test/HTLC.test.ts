@@ -10,10 +10,13 @@ describe("HTLC Contract", function () {
   let other: SignerWithAddress;
 
   const secret = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-  const hashlock = ethers.keccak256(ethers.solidityPacked(["bytes32"], [secret]));
+  // Fixed: Use SHA256 instead of keccak256 for Stellar compatibility
+  const hashlock = ethers.sha256(ethers.solidityPacked(["bytes32"], [secret]));
   const amount = ethers.parseEther("1.0");
   const safetyDeposit = ethers.parseEther("0.1");
-  const timelock = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
+  
+  // Fixed: Use dynamic timelock to avoid timing issues
+  let timelock: number;
 
   beforeEach(async function () {
     [sender, receiver, other] = await ethers.getSigners();
@@ -21,6 +24,10 @@ describe("HTLC Contract", function () {
     const HTLCFactory = await ethers.getContractFactory("HTLC");
     htlc = await HTLCFactory.deploy();
     await htlc.waitForDeployment();
+    
+    // Set timelock dynamically to current block timestamp + 1 hour
+    const currentBlock = await ethers.provider.getBlock('latest');
+    timelock = currentBlock!.timestamp + 3600;
   });
 
   describe("createHTLC", function () {
@@ -67,7 +74,9 @@ describe("HTLC Contract", function () {
     });
 
     it("Should fail with expired timelock", async function () {
-      const pastTimelock = Math.floor(Date.now() / 1000) - 3600; // 1 hour ago
+      // Fixed: Use current block timestamp for accurate past time
+      const currentBlock = await ethers.provider.getBlock('latest');
+      const pastTimelock = currentBlock!.timestamp - 3600; // 1 hour ago
       
       await expect(
         htlc.connect(sender).createHTLC(
@@ -101,6 +110,10 @@ describe("HTLC Contract", function () {
     let contractId: string;
 
     beforeEach(async function () {
+      // Reset timelock for each test
+      const currentBlock = await ethers.provider.getBlock('latest');
+      timelock = currentBlock!.timestamp + 3600;
+      
       const totalAmount = amount + safetyDeposit;
       const tx = await htlc.connect(sender).createHTLC(
         receiver.address,
@@ -182,6 +195,10 @@ describe("HTLC Contract", function () {
     let contractId: string;
 
     beforeEach(async function () {
+      // Reset timelock for each test
+      const currentBlock = await ethers.provider.getBlock('latest');
+      timelock = currentBlock!.timestamp + 3600;
+      
       const totalAmount = amount + safetyDeposit;
       const tx = await htlc.connect(sender).createHTLC(
         receiver.address,
@@ -255,6 +272,10 @@ describe("HTLC Contract", function () {
     let contractId: string;
 
     beforeEach(async function () {
+      // Reset timelock for each test
+      const currentBlock = await ethers.provider.getBlock('latest');
+      timelock = currentBlock!.timestamp + 3600;
+      
       const totalAmount = amount + safetyDeposit;
       const tx = await htlc.connect(sender).createHTLC(
         receiver.address,
@@ -316,7 +337,8 @@ describe("HTLC Contract", function () {
 
   describe("generateContractId", function () {
     it("Should generate consistent contract IDs", async function () {
-      const timestamp = Math.floor(Date.now() / 1000);
+      const currentBlock = await ethers.provider.getBlock('latest');
+      const timestamp = currentBlock!.timestamp;
       
       const id1 = await htlc.generateContractId(
         sender.address,
@@ -340,7 +362,8 @@ describe("HTLC Contract", function () {
     });
 
     it("Should generate different IDs for different parameters", async function () {
-      const timestamp = Math.floor(Date.now() / 1000);
+      const currentBlock = await ethers.provider.getBlock('latest');
+      const timestamp = currentBlock!.timestamp;
       
       const id1 = await htlc.generateContractId(
         sender.address,
@@ -361,6 +384,28 @@ describe("HTLC Contract", function () {
       );
       
       expect(id1).to.not.equal(id2);
+    });
+  });
+
+  describe("Helper functions", function () {
+    it("Should create and verify hashlock correctly", async function () {
+      const testSecret = "0xabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd";
+      const createdHashlock = await htlc.createHashlock(testSecret);
+      
+      const isValid = await htlc.verifyPreimage(testSecret, createdHashlock);
+      expect(isValid).to.be.true;
+      
+      const wrongSecret = "0x1111111111111111111111111111111111111111111111111111111111111111";
+      const isInvalid = await htlc.verifyPreimage(wrongSecret, createdHashlock);
+      expect(isInvalid).to.be.false;
+    });
+
+    it("Should work with contract's createHashlock function", async function () {
+      const testSecret = "0xabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd";
+      const contractHashlock = await htlc.createHashlock(testSecret);
+      const jsHashlock = ethers.sha256(ethers.solidityPacked(["bytes32"], [testSecret]));
+      
+      expect(contractHashlock).to.equal(jsHashlock);
     });
   });
 });
