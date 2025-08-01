@@ -1,10 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, BytesN, Env,
-};
+use soroban_sdk::{testutils::Ledger, Address, BytesN, Env};
 
 // Constants used in most tests
 const AMOUNT: i128 = 1_000_000_000; // 100 XLM (7 decimals)
