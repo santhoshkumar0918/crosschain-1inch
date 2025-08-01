@@ -14,10 +14,10 @@ categories = ["cryptography", "blockchain"]
 crate-type = ["cdylib"]
 
 [dependencies]
-soroban-sdk = "21.7.7"
+soroban-sdk = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.7.7", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
