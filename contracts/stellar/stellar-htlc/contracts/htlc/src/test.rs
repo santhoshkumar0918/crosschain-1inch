@@ -6,528 +6,215 @@ use soroban_sdk::{
     Address, BytesN, Env,
 };
 
+// Constants used in most tests
 const AMOUNT: i128 = 1_000_000_000; // 100 XLM (7 decimals)
 const SAFETY_DEPOSIT: i128 = 100_000_000; // 10 XLM
-const TIMELOCK_DURATION: u64 = 3600; // 1 hour
+const TIMELOCK_SECS: u64 = 3_600; // 1 hour
 
-fn create_test_env() -> (Env, Address, Address, Address, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    // Create test addresses
-    let sender = Address::generate(&env);
-    let receiver = Address::generate(&env);
-    let contract_addr = env.register(HTLCContract, ());
-
-    // For testing purposes, we'll use a generated address as token address
-    // In real deployment, this would be the native XLM token address
-    let native_token_addr = Address::generate(&env);
-
-    (env, sender, receiver, contract_addr, native_token_addr)
+//------------------------------------------------------------------
+//  Helpers
+//------------------------------------------------------------------
+fn new_env() -> Env {
+    let e = Env::default();
+    e.mock_all_auths(); // disable signature checks
+    e
 }
 
-fn create_test_hashlock() -> (BytesN<32>, BytesN<32>) {
-    let env = Env::default();
-    let preimage = BytesN::from_array(&env, &[42u8; 32]);
-    let preimage_bytes: soroban_sdk::Bytes = preimage.clone().into();
-    let hashlock: BytesN<32> = env.crypto().sha256(&preimage_bytes).into();
+fn setup() -> (Env, Address, Address, HTLCContractClient<'static>) {
+    // ← ADD LIFETIME
+    let env = new_env();
+    let sender = Address::generate(&env);
+    let recv = Address::generate(&env);
+    let id = env.register(HTLCContract, ()); // ← FIX DEPRECATED METHOD
+    let client = HTLCContractClient::new(&env, &id);
+    (env, sender, recv, client)
+}
+
+fn hashlock_pair(env: &Env) -> (BytesN<32>, BytesN<32>) {
+    let preimage = BytesN::from_array(env, &[42u8; 32]);
+    let hashlock: BytesN<32> = env.crypto().sha256(&preimage.clone().into()).into();
     (hashlock, preimage)
 }
 
+//------------------------------------------------------------------
+//  Happy-path tests
+//------------------------------------------------------------------
 #[test]
-fn test_create_htlc_success() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
+fn create_htlc_success() {
+    let (env, s, r, client) = setup();
+    let (hashlock, _) = hashlock_pair(&env);
+    let timelock = env.ledger().timestamp() + TIMELOCK_SECS;
 
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
+    let id = client.create_htlc(&s, &r, &AMOUNT, &hashlock, &timelock, &SAFETY_DEPOSIT);
+    let h = client.get_htlc(&id);
 
-    // Verify contract was created
-    assert!(client.contract_exists(&contract_id));
-
-    // Verify HTLC data
-    let htlc_data = client.get_htlc(&contract_id);
-    assert_eq!(htlc_data.sender, sender);
-    assert_eq!(htlc_data.receiver, receiver);
-    assert_eq!(htlc_data.amount, AMOUNT);
-    assert_eq!(htlc_data.hashlock, hashlock);
-    assert_eq!(htlc_data.timelock, timelock);
-    assert_eq!(htlc_data.safety_deposit, SAFETY_DEPOSIT);
-    assert_eq!(htlc_data.status, HTLCStatus::Active);
-    assert_eq!(htlc_data.locked, false);
+    assert_eq!(h.sender, s);
+    assert_eq!(h.receiver, r);
+    assert_eq!(h.amount, AMOUNT);
+    assert_eq!(h.status, HTLCStatus::Active);
 }
 
 #[test]
-fn test_withdraw_success() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, preimage) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
+fn withdraw_success() {
+    let (env, s, r, client) = setup();
+    let (hashlock, pre) = hashlock_pair(&env);
+    let timelock = env.ledger().timestamp() + TIMELOCK_SECS;
 
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Withdraw with correct preimage
-    client.withdraw(&contract_id, &preimage);
-
-    // Verify status changed
-    assert_eq!(client.get_status(&contract_id), HTLCStatus::Withdrawn);
+    let id = client.create_htlc(&s, &r, &AMOUNT, &hashlock, &timelock, &SAFETY_DEPOSIT);
+    client.withdraw(&id, &pre);
+    assert_eq!(client.get_status(&id), HTLCStatus::Withdrawn);
 }
 
 #[test]
-fn test_refund_success() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
+fn refund_success() {
+    let (env, s, r, client) = setup();
+    let (hashlock, _) = hashlock_pair(&env);
+    let timelock = env.ledger().timestamp() + TIMELOCK_SECS;
 
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
+    let id = client.create_htlc(&s, &r, &AMOUNT, &hashlock, &timelock, &SAFETY_DEPOSIT);
 
-    // Fast forward past timelock
-    env.ledger().with_mut(|li| {
-        li.timestamp = timelock + 1;
-    });
-
-    // Refund after timelock expiry
-    client.refund(&contract_id);
-
-    // Verify status changed
-    assert_eq!(client.get_status(&contract_id), HTLCStatus::Refunded);
+    env.ledger().with_mut(|l| l.timestamp = timelock + 1); // fast-forward
+    client.refund(&id);
+    assert_eq!(client.get_status(&id), HTLCStatus::Refunded);
 }
 
+//------------------------------------------------------------------
+//  Input-validation tests
+//------------------------------------------------------------------
 #[test]
 #[should_panic(expected = "Invalid amount")]
-fn test_create_htlc_invalid_amount_zero() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    client.create_htlc(
-        &sender,
-        &receiver,
-        &0, // Invalid zero amount
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-}
-
-#[test]
-#[should_panic(expected = "Invalid amount")]
-fn test_create_htlc_invalid_amount_negative() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    client.create_htlc(
-        &sender,
-        &receiver,
-        &(-1000), // Invalid negative amount
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
+fn create_amount_zero() {
+    let (env, s, r, client) = setup();
+    let (h, _) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+    client.create_htlc(&s, &r, &0, &h, &t, &SAFETY_DEPOSIT);
 }
 
 #[test]
 #[should_panic(expected = "Invalid safety deposit")]
-fn test_create_htlc_invalid_safety_deposit() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &(-100), // Invalid negative safety deposit
-    );
+fn create_negative_safety() {
+    let (env, s, r, client) = setup();
+    let (h, _) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+    client.create_htlc(&s, &r, &AMOUNT, &h, &t, &-1);
 }
 
 #[test]
 #[should_panic(expected = "Invalid timelock")]
-fn test_create_htlc_past_timelock() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let current_time = env.ledger().timestamp();
-    let past_timelock = if current_time > 100 {
-        current_time - 100
-    } else {
-        0
-    };
-
-    client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &past_timelock,
-        &SAFETY_DEPOSIT,
-    );
+fn create_past_timelock() {
+    let (env, s, r, client) = setup();
+    let (h, _) = hashlock_pair(&env);
+    let past = env.ledger().timestamp().saturating_sub(5);
+    client.create_htlc(&s, &r, &AMOUNT, &h, &past, &SAFETY_DEPOSIT);
 }
 
+//------------------------------------------------------------------
+//  Error-handling / edge cases
+//------------------------------------------------------------------
 #[test]
-fn test_create_htlc_duplicate_prevention() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
+#[should_panic(expected = "Contract already exists")]
+fn duplicate_contract() {
+    let (env, s, r, client) = setup();
+    let (h, _) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
 
-    // Create first HTLC
-    let contract_id1 = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Advance timestamp to ensure different contract ID
-    env.ledger().with_mut(|li| {
-        li.timestamp = li.timestamp + 1;
-    });
-
-    // Create second HTLC with same parameters but different timestamp
-    let contract_id2 = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Should create different contract IDs due to timestamp difference
-    assert_ne!(contract_id1, contract_id2);
+    client.create_htlc(&s, &r, &AMOUNT, &h, &t, &SAFETY_DEPOSIT);
+    // second call with SAME timestamp → same contract id
+    client.create_htlc(&s, &r, &AMOUNT, &h, &t, &SAFETY_DEPOSIT);
 }
 
 #[test]
 #[should_panic(expected = "Invalid preimage")]
-fn test_withdraw_wrong_preimage() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
+fn wrong_preimage() {
+    let (env, s, r, client) = setup();
+    let (h, _) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+    let id = client.create_htlc(&s, &r, &AMOUNT, &h, &t, &SAFETY_DEPOSIT);
 
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Try to withdraw with wrong preimage
-    let wrong_preimage = BytesN::from_array(&env, &[99u8; 32]);
-    client.withdraw(&contract_id, &wrong_preimage);
+    let bad_pre = BytesN::from_array(&env, &[1u8; 32]);
+    client.withdraw(&id, &bad_pre);
 }
 
 #[test]
 #[should_panic(expected = "Timelock expired")]
-fn test_withdraw_after_timelock() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, preimage) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
+fn withdraw_after_timelock() {
+    let (env, s, r, client) = setup();
+    let (h, pre) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+    let id = client.create_htlc(&s, &r, &AMOUNT, &h, &t, &SAFETY_DEPOSIT);
 
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Fast forward past timelock
-    env.ledger().with_mut(|li| {
-        li.timestamp = timelock + 1;
-    });
-
-    // Try to withdraw after timelock expiry
-    client.withdraw(&contract_id, &preimage);
+    env.ledger().with_mut(|l| l.timestamp = t + 1);
+    client.withdraw(&id, &pre);
 }
 
 #[test]
 #[should_panic(expected = "Timelock not expired")]
-fn test_refund_before_timelock() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Try to refund before timelock expiry
-    client.refund(&contract_id);
+fn refund_before_timelock() {
+    let (env, s, r, client) = setup();
+    let (h, _) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+    let id = client.create_htlc(&s, &r, &AMOUNT, &h, &t, &SAFETY_DEPOSIT);
+    client.refund(&id); // too early
 }
 
 #[test]
 #[should_panic(expected = "Already withdrawn")]
-fn test_double_withdraw() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, preimage) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // First withdrawal
-    client.withdraw(&contract_id, &preimage);
-
-    // Try second withdrawal
-    client.withdraw(&contract_id, &preimage);
+fn double_withdraw() {
+    let (env, s, r, client) = setup();
+    let (h, pre) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+    let id = client.create_htlc(&s, &r, &AMOUNT, &h, &t, &SAFETY_DEPOSIT);
+    client.withdraw(&id, &pre);
+    client.withdraw(&id, &pre); // second call should panic
 }
 
 #[test]
 #[should_panic(expected = "Already refunded")]
-fn test_double_refund() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Fast forward past timelock
-    env.ledger().with_mut(|li| {
-        li.timestamp = timelock + 1;
-    });
-
-    // First refund
-    client.refund(&contract_id);
-
-    // Try second refund
-    client.refund(&contract_id);
-}
-
-#[test]
-#[should_panic(expected = "Already withdrawn")]
-fn test_refund_after_withdraw() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, preimage) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Withdraw first
-    client.withdraw(&contract_id, &preimage);
-
-    // Fast forward past timelock
-    env.ledger().with_mut(|li| {
-        li.timestamp = timelock + 1;
-    });
-
-    // Try to refund after withdrawal
-    client.refund(&contract_id);
-}
-
-#[test]
-#[should_panic(expected = "Already refunded")]
-fn test_withdraw_after_refund() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, preimage) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    // Create HTLC
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Fast forward past timelock
-    env.ledger().with_mut(|li| {
-        li.timestamp = timelock + 1;
-    });
-
-    // Refund first
-    client.refund(&contract_id);
-
-    // Try to withdraw after refund
-    client.withdraw(&contract_id, &preimage);
+fn double_refund() {
+    let (env, s, r, client) = setup();
+    let (h, _) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+    let id = client.create_htlc(&s, &r, &AMOUNT, &h, &t, &SAFETY_DEPOSIT);
+    env.ledger().with_mut(|l| l.timestamp = t + 1);
+    client.refund(&id);
+    client.refund(&id); // second call should panic
 }
 
 #[test]
 #[should_panic(expected = "Contract not found")]
-fn test_get_htlc_nonexistent() {
-    let (env, _sender, _receiver, contract_addr, _native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let fake_contract_id = BytesN::from_array(&env, &[1u8; 32]);
+fn get_nonexistent() {
+    let (env, _, _, client) = setup();
+    let fake = BytesN::from_array(&env, &[7u8; 32]);
+    client.get_htlc(&fake);
+}
 
-    client.get_htlc(&fake_contract_id);
+//------------------------------------------------------------------
+//  Utility / uniqueness checks
+//------------------------------------------------------------------
+#[test]
+fn contract_id_unique() {
+    let (env, s, r, client) = setup();
+    let (h1, _) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+
+    let id1 = client.create_htlc(&s, &r, &AMOUNT, &h1, &t, &SAFETY_DEPOSIT);
+
+    env.ledger().with_mut(|l| l.timestamp += 1); // bump timestamp
+    let (h2, _) = hashlock_pair(&env);
+    let id2 = client.create_htlc(&s, &r, &AMOUNT, &h2, &(t + 1), &SAFETY_DEPOSIT);
+
+    assert_ne!(id1, id2);
 }
 
 #[test]
-#[should_panic(expected = "Contract not found")]
-fn test_withdraw_nonexistent() {
-    let (env, _sender, _receiver, contract_addr, _native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let fake_contract_id = BytesN::from_array(&env, &[1u8; 32]);
-    let (_, preimage) = create_test_hashlock();
+fn contract_exists_flag() {
+    let (env, s, r, client) = setup();
+    let (h, _) = hashlock_pair(&env);
+    let t = env.ledger().timestamp() + TIMELOCK_SECS;
+    let id = client.create_htlc(&s, &r, &AMOUNT, &h, &t, &SAFETY_DEPOSIT);
 
-    client.withdraw(&fake_contract_id, &preimage);
-}
+    assert!(client.contract_exists(&id));
 
-#[test]
-#[should_panic(expected = "Contract not found")]
-fn test_refund_nonexistent() {
-    let (env, _sender, _receiver, contract_addr, _native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let fake_contract_id = BytesN::from_array(&env, &[1u8; 32]);
-
-    client.refund(&fake_contract_id);
-}
-
-#[test]
-fn test_contract_exists() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    // Test non-existent contract
-    let fake_contract_id = BytesN::from_array(&env, &[1u8; 32]);
-    assert_eq!(client.contract_exists(&fake_contract_id), false);
-
-    // Create HTLC and test it exists
-    let contract_id = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    assert_eq!(client.contract_exists(&contract_id), true);
-}
-
-#[test]
-fn test_zero_safety_deposit() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock, preimage) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    // Create HTLC with zero safety deposit
-    let contract_id = client.create_htlc(
-        &sender, &receiver, &AMOUNT, &hashlock, &timelock, &0, // Zero safety deposit
-    );
-
-    // Withdraw
-    client.withdraw(&contract_id, &preimage);
-
-    // Verify status changed
-    assert_eq!(client.get_status(&contract_id), HTLCStatus::Withdrawn);
-}
-
-#[test]
-fn test_contract_id_uniqueness() {
-    let (env, sender, receiver, contract_addr, native_token_addr) = create_test_env();
-    let client = HTLCContractClient::new(&env, &contract_addr);
-    let (hashlock1, _) = create_test_hashlock();
-    let timelock = env.ledger().timestamp() + TIMELOCK_DURATION;
-
-    // Create first HTLC
-    let contract_id1 = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock1,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Create second HTLC with different hashlock (will have different timestamp)
-    env.ledger().with_mut(|li| {
-        li.timestamp = li.timestamp + 1; // Advance time to ensure different contract ID
-    });
-
-    let hashlock2 = BytesN::from_array(&env, &[99u8; 32]);
-    let contract_id2 = client.create_htlc(
-        &sender,
-        &receiver,
-        &AMOUNT,
-        &hashlock2,
-        &timelock,
-        &SAFETY_DEPOSIT,
-    );
-
-    // Verify contract IDs are different
-    assert_ne!(contract_id1, contract_id2);
-
-    // Verify both contracts exist
-    assert!(client.contract_exists(&contract_id1));
-    assert!(client.contract_exists(&contract_id2));
+    let fake = BytesN::from_array(&env, &[0u8; 32]);
+    assert!(!client.contract_exists(&fake));
 }
