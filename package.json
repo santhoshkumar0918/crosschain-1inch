@@ -2,10 +2,28 @@
   "name": "crosschain",
   "version": "0.1.0",
   "private": true,
+  "workspaces": [
+    "packages/*",
+    "app"
+  ],
   "scripts": {
-    "dev": "next dev --turbopack",
-    "build": "next build",
-    "start": "next start",
+    "dev": "concurrently \"npm run dev:resolver\" \"npm run dev:relayer\" \"npm run dev:app\"",
+    "dev:resolver": "cd packages/resolver && npm run dev",
+    "dev:relayer": "cd packages/relayer && npm run dev", 
+    "dev:app": "cd app && npm run dev",
+    "build": "npm run build:resolver && npm run build:relayer && npm run build:app",
+    "build:resolver": "cd packages/resolver && npm run build",
+    "build:relayer": "cd packages/relayer && npm run build",
+    "build:app": "cd app && npm run build",
+    "start:resolver": "cd packages/resolver && npm start",
+    "start:relayer": "cd packages/relayer && npm start",
+    "start:app": "cd app && npm start",
+    "test": "npm run test:resolver && npm run test:relayer",
+    "test:resolver": "cd packages/resolver && npm test",
+    "test:relayer": "cd packages/relayer && npm test",
+    "demo": "echo 'Starting full demo...' && concurrently \"npm run start:resolver\" \"npm run start:relayer\" \"npm run start:app\"",
+    "setup": "npm install && cd packages/resolver && npm install && cd ../relayer && npm install && cd ../../app && npm install",
+    
     "lint": "next lint"
   },
   "dependencies": {
@@ -28,6 +46,11 @@
     "@types/react-dom": "^19",
     "hardhat": "^2.26.1",
     "tailwindcss": "^4",
-    "typescript": "^5"
-  }
+    "typescript": "^5",
+    "concurrently": "^8.2.0"
+  },
+  "description": "Cross-chain atomic swaps between Ethereum and Stellar using 1inch Fusion+ escrow pattern",
+  "keywords": ["cross-chain", "atomic-swaps", "ethereum", "stellar", "1inch", "fusion", "htlc"],
+  "author": "CrossChain Team",
+  "license": "MIT"
 }

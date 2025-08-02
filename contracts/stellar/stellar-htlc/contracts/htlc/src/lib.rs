@@ -290,6 +290,7 @@ impl HTLCContract {
         amount: i128,
         hashlock: &BytesN<32>,
         timelock: u64,
+
         timestamp: u64,
     ) -> BytesN<32> {
         let mut packed_data = Bytes::new(env);
