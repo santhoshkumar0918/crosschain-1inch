@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@mysten/sui.js": "^0.54.1",
+    "@openzeppelin/contracts": "^5.4.0",
     "@polkadot/api": "^16.4.2",
     "@polkadot/keyring": "^13.5.4",
     "dotenv": "^17.2.1",
