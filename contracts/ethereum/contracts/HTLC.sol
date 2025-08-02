@@ -10,6 +10,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
  * @title HTLC - Hash Time-Locked Contract for Cross-Chain Atomic Swaps
  * @dev Production-ready Ethereum HTLC contract compatible with 1inch Fusion+ pattern
  * @dev Designed for cross-chain atomic swaps with Stellar blockchain
+ * @dev Enhanced with partial fill functionality for ETHGlobal hackathon
  */
 contract HTLC is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -17,7 +18,8 @@ contract HTLC is ReentrancyGuard {
     enum HTLCStatus {
         Active,
         Withdrawn,
-        Refunded
+        Refunded,
+        PartiallyFilled
     }
 
     struct HTLCData {
@@ -25,18 +27,37 @@ contract HTLC is ReentrancyGuard {
         address sender;
         address receiver;
         uint256 amount;
+        uint256 remainingAmount; // For partial fills
+        uint256 filledAmount;    // Track filled amount
         address tokenAddress;
         bytes32 hashlock;
         uint256 timelock;
         uint256 timestamp;
         uint256 safetyDeposit;
+        uint256 remainingSafetyDeposit; // For partial fills
         HTLCStatus status;
+        bool allowPartialFills;
+        uint256 minFillAmount; // Minimum amount for partial fills
+    }
+
+    struct HTLCCreationParams {
+        address receiver;
+        uint256 amount;
+        address tokenAddress;
+        bytes32 hashlock;
+        uint256 timelock;
+        uint256 safetyDeposit;
+        bool allowPartialFills;
+        uint256 minFillAmount;
     }
 
     // Mapping from contract ID to HTLC data
     mapping(bytes32 => HTLCData) public htlcs;
     
-    // Events - 1inch Fusion+ compatible
+    // Track partial withdrawals
+    mapping(bytes32 => mapping(address => uint256)) public partialWithdrawals;
+    
+    // Events - 1inch Fusion+ compatible with partial fill support
     event HTLCNew(
         bytes32 indexed contractId,
         address indexed sender,
@@ -45,16 +66,29 @@ contract HTLC is ReentrancyGuard {
         address tokenAddress,
         bytes32 hashlock,
         uint256 timelock,
-        uint256 safetyDeposit
+        uint256 safetyDeposit,
+        bool allowPartialFills,
+        uint256 minFillAmount
     );
     
     event HTLCWithdraw(
         bytes32 indexed contractId,
-        bytes32 preimage
+        bytes32 preimage,
+        uint256 withdrawAmount,
+        bool isPartial
+    );
+    
+    event HTLCPartialFill(
+        bytes32 indexed contractId,
+        address indexed filler,
+        uint256 fillAmount,
+        uint256 remainingAmount
     );
     
     event HTLCRefund(
-        bytes32 indexed contractId
+        bytes32 indexed contractId,
+        uint256 refundAmount,
+        bool isPartial
     );
 
     // Custom errors for gas efficiency
@@ -70,17 +104,14 @@ contract HTLC is ReentrancyGuard {
     error ContractNotActive();
     error AlreadyWithdrawn();
     error AlreadyRefunded();
+    error PartialFillsNotAllowed();
+    error BelowMinimumFill();
+    error InsufficientRemainingAmount();
+    error NoPartialFillsToRefund();
 
     /**
      * @dev Creates a new HTLC with ETH or ERC20 tokens
-     * @dev Following 1inch Fusion+ pattern with safety deposit
-     * @param receiver Address that can withdraw funds with correct preimage
-     * @param amount Amount of tokens/ETH to lock
-     * @param tokenAddress Address of ERC20 token (address(0) for ETH)
-     * @param hashlock SHA256 hash of the secret
-     * @param timelock Unix timestamp when refund becomes available
-     * @param safetyDeposit Additional deposit for security (in same token)
-     * @return contractId Unique identifier for this HTLC
+     * @dev Following 1inch Fusion+ pattern with safety deposit and partial fills
      */
     function createHTLC(
         address receiver,
@@ -88,42 +119,91 @@ contract HTLC is ReentrancyGuard {
         address tokenAddress,
         bytes32 hashlock,
         uint256 timelock,
-        uint256 safetyDeposit
+        uint256 safetyDeposit,
+        bool allowPartialFills,
+        uint256 minFillAmount
     ) external payable nonReentrant returns (bytes32 contractId) {
-        // Input validation
-        if (amount == 0) revert InvalidAmount();
-        // More lenient timelock validation for testing
-        if (timelock <= block.timestamp) revert InvalidTimelock();
-        if (receiver == address(0)) revert Unauthorized();
-        if (hashlock == bytes32(0)) revert InvalidAmount();
+        HTLCCreationParams memory params = HTLCCreationParams({
+            receiver: receiver,
+            amount: amount,
+            tokenAddress: tokenAddress,
+            hashlock: hashlock,
+            timelock: timelock,
+            safetyDeposit: safetyDeposit,
+            allowPartialFills: allowPartialFills,
+            minFillAmount: minFillAmount
+        });
 
-        // Generate contract ID matching Stellar pattern
+        return _createHTLCInternal(params);
+    }
+
+    /**
+     * @dev Internal function to create HTLC - reduces stack depth
+     */
+    function _createHTLCInternal(HTLCCreationParams memory params) internal returns (bytes32 contractId) {
+        // Validation
+        _validateHTLCParams(params);
+
+        // Generate contract ID
         contractId = generateContractId(
             msg.sender,
-            receiver,
-            amount,
-            hashlock,
-            timelock,
+            params.receiver,
+            params.amount,
+            params.hashlock,
+            params.timelock,
             block.timestamp
         );
 
-        // Check if contract already exists
         if (htlcs[contractId].sender != address(0)) {
             revert ContractAlreadyExists();
         }
 
-        uint256 totalAmount = amount + safetyDeposit;
+        // Handle transfers
+        _handleHTLCTransfers(params);
 
-        // Handle ETH vs ERC20 token transfers
-        if (tokenAddress == address(0)) {
+        // Create HTLC data
+        _storeHTLCData(contractId, params);
+
+        // Emit event
+        emit HTLCNew(
+            contractId,
+            msg.sender,
+            params.receiver,
+            params.amount,
+            params.tokenAddress,
+            params.hashlock,
+            params.timelock,
+            params.safetyDeposit,
+            params.allowPartialFills,
+            params.minFillAmount
+        );
+    }
+
+    /**
+     * @dev Validates HTLC creation parameters
+     */
+    function _validateHTLCParams(HTLCCreationParams memory params) internal view {
+        if (params.amount == 0) revert InvalidAmount();
+        if (params.timelock <= block.timestamp) revert InvalidTimelock();
+        if (params.receiver == address(0)) revert Unauthorized();
+        if (params.hashlock == bytes32(0)) revert InvalidAmount();
+        if (params.allowPartialFills && params.minFillAmount > params.amount) revert InvalidAmount();
+    }
+
+    /**
+     * @dev Handles token transfers for HTLC creation
+     */
+    function _handleHTLCTransfers(HTLCCreationParams memory params) internal {
+        uint256 totalAmount = params.amount + params.safetyDeposit;
+
+        if (params.tokenAddress == address(0)) {
             // ETH transfer
             if (msg.value != totalAmount) revert InsufficientBalance();
         } else {
             // ERC20 token transfer
             if (msg.value != 0) revert InvalidAmount();
-            IERC20 token = IERC20(tokenAddress);
+            IERC20 token = IERC20(params.tokenAddress);
             
-            // Check allowance and balance
             if (token.allowance(msg.sender, address(this)) < totalAmount) {
                 revert InsufficientBalance();
             }
@@ -131,145 +211,210 @@ contract HTLC is ReentrancyGuard {
                 revert InsufficientBalance();
             }
             
-            // Transfer tokens to contract
             token.safeTransferFrom(msg.sender, address(this), totalAmount);
         }
-
-        // Create HTLC data
-        htlcs[contractId] = HTLCData({
-            contractId: contractId,
-            sender: msg.sender,
-            receiver: receiver,
-            amount: amount,
-            tokenAddress: tokenAddress,
-            hashlock: hashlock,
-            timelock: timelock,
-            timestamp: block.timestamp,
-            safetyDeposit: safetyDeposit,
-            status: HTLCStatus.Active
-        });
-
-        // Emit HTLCNew event - 1inch Fusion+ compatible
-        emit HTLCNew(
-            contractId,
-            msg.sender,
-            receiver,
-            amount,
-            tokenAddress,
-            hashlock,
-            timelock,
-            safetyDeposit
-        );
     }
 
     /**
-     * @dev Withdraws funds by revealing the preimage
-     * @param contractId Unique identifier of the HTLC
-     * @param preimage Secret that hashes to the hashlock
+     * @dev Stores HTLC data in storage
      */
-    function withdraw(bytes32 contractId, bytes32 preimage) external nonReentrant {
+    function _storeHTLCData(bytes32 contractId, HTLCCreationParams memory params) internal {
+        htlcs[contractId] = HTLCData({
+            contractId: contractId,
+            sender: msg.sender,
+            receiver: params.receiver,
+            amount: params.amount,
+            remainingAmount: params.amount,
+            filledAmount: 0,
+            tokenAddress: params.tokenAddress,
+            hashlock: params.hashlock,
+            timelock: params.timelock,
+            timestamp: block.timestamp,
+            safetyDeposit: params.safetyDeposit,
+            remainingSafetyDeposit: params.safetyDeposit,
+            status: HTLCStatus.Active,
+            allowPartialFills: params.allowPartialFills,
+            minFillAmount: params.minFillAmount
+        });
+    }
+
+    /**
+     * @dev Withdraws funds by revealing the preimage (supports partial withdrawals)
+     */
+    function withdraw(bytes32 contractId, bytes32 preimage, uint256 withdrawAmount) external nonReentrant {
         HTLCData storage htlc = htlcs[contractId];
         
-        // Contract existence check
+        // Validate withdrawal
+        _validateWithdrawal(htlc, preimage, withdrawAmount);
+
+        // Calculate withdrawal amounts
+        (uint256 actualWithdrawAmount, uint256 safetyDepositReturn, bool isPartial) = 
+            _calculateWithdrawalAmounts(htlc, withdrawAmount);
+
+        // Update HTLC state
+        _updateHTLCForWithdrawal(htlc, actualWithdrawAmount, safetyDepositReturn, isPartial);
+
+        // Execute transfers
+        _executeWithdrawalTransfers(htlc, actualWithdrawAmount, safetyDepositReturn);
+
+        // Track and emit events
+        partialWithdrawals[contractId][htlc.receiver] += actualWithdrawAmount;
+        
+        if (isPartial) {
+            emit HTLCPartialFill(contractId, htlc.receiver, actualWithdrawAmount, htlc.remainingAmount);
+        }
+        
+        emit HTLCWithdraw(contractId, preimage, actualWithdrawAmount, isPartial);
+    }
+
+    /**
+     * @dev Validates withdrawal conditions - FIXED: Added withdrawAmount validation
+     */
+    function _validateWithdrawal(HTLCData storage htlc, bytes32 preimage, uint256 withdrawAmount) internal view {
         if (htlc.sender == address(0)) revert ContractNotFound();
-        
-        // Authorization check - only receiver can withdraw
         if (msg.sender != htlc.receiver) revert Unauthorized();
-        
-        // Status check
         if (htlc.status == HTLCStatus.Withdrawn) revert AlreadyWithdrawn();
         if (htlc.status == HTLCStatus.Refunded) revert AlreadyRefunded();
-        if (htlc.status != HTLCStatus.Active) revert ContractNotActive();
-        
-        // Timelock check - must withdraw before expiry
+        if (htlc.status != HTLCStatus.Active && htlc.status != HTLCStatus.PartiallyFilled) revert ContractNotActive();
         if (block.timestamp >= htlc.timelock) revert TimelockExpired();
         
-        // Validate preimage against hashlock - support multiple hash formats
-        bytes32 computedHash;
+        // FIXED: Validate withdraw amount before other checks
+        if (withdrawAmount > 0 && withdrawAmount > htlc.remainingAmount) {
+            revert InsufficientRemainingAmount();
+        }
         
-        // Try different encoding methods for compatibility
-        computedHash = sha256(abi.encodePacked(preimage));
+        // Validate preimage
+        bytes32 computedHash = sha256(abi.encodePacked(preimage));
         if (computedHash != htlc.hashlock) {
-            // Try alternative encoding
             computedHash = keccak256(abi.encodePacked(preimage));
-            if (computedHash != htlc.hashlock) {
-                // Try direct bytes32 to bytes32 comparison
-                if (preimage != htlc.hashlock) {
-                    revert InvalidPreimage();
-                }
+            if (computedHash != htlc.hashlock && preimage != htlc.hashlock) {
+                revert InvalidPreimage();
             }
         }
+    }
 
-        // Update status to withdrawn
-        htlc.status = HTLCStatus.Withdrawn;
+    /**
+     * @dev Calculates withdrawal amounts - FIXED: Proper partial withdrawal logic
+     */
+    function _calculateWithdrawalAmounts(HTLCData storage htlc, uint256 withdrawAmount) 
+        internal view returns (uint256 actualWithdrawAmount, uint256 safetyDepositReturn, bool isPartial) {
+        
+        if (withdrawAmount == 0 || withdrawAmount >= htlc.remainingAmount) {
+            // Full withdrawal of remaining amount
+            actualWithdrawAmount = htlc.remainingAmount;
+            safetyDepositReturn = htlc.remainingSafetyDeposit;
+            isPartial = false;
+        } else {
+            // Partial withdrawal - FIXED: Better validation and calculation
+            if (!htlc.allowPartialFills) revert PartialFillsNotAllowed();
+            if (htlc.minFillAmount > 0 && withdrawAmount < htlc.minFillAmount) revert BelowMinimumFill();
+            
+            actualWithdrawAmount = withdrawAmount;
+            // FIXED: Proportional safety deposit calculation
+            safetyDepositReturn = (htlc.remainingSafetyDeposit * actualWithdrawAmount) / htlc.remainingAmount;
+            isPartial = true;
+        }
+    }
 
-        // Transfer funds
+    /**
+     * @dev Updates HTLC state for withdrawal - FIXED: Proper state updates
+     */
+    function _updateHTLCForWithdrawal(
+        HTLCData storage htlc, 
+        uint256 actualWithdrawAmount, 
+        uint256 safetyDepositReturn, 
+        bool isPartial
+    ) internal {
+        // Update amounts first
+        htlc.remainingAmount -= actualWithdrawAmount;
+        htlc.filledAmount += actualWithdrawAmount;
+        htlc.remainingSafetyDeposit -= safetyDepositReturn;
+        
+        // FIXED: Update status based on remaining amount
+        if (htlc.remainingAmount == 0) {
+            htlc.status = HTLCStatus.Withdrawn;
+        } else {
+            htlc.status = HTLCStatus.PartiallyFilled;
+        }
+    }
+
+    /**
+     * @dev Executes withdrawal transfers
+     */
+    function _executeWithdrawalTransfers(
+        HTLCData storage htlc, 
+        uint256 actualWithdrawAmount, 
+        uint256 safetyDepositReturn
+    ) internal {
         if (htlc.tokenAddress == address(0)) {
             // ETH transfers
-            (bool success1, ) = payable(htlc.receiver).call{value: htlc.amount}("");
+            (bool success1, ) = payable(htlc.receiver).call{value: actualWithdrawAmount}("");
             require(success1, "ETH transfer to receiver failed");
             
-            if (htlc.safetyDeposit > 0) {
-                (bool success2, ) = payable(htlc.sender).call{value: htlc.safetyDeposit}("");
+            if (safetyDepositReturn > 0) {
+                (bool success2, ) = payable(htlc.sender).call{value: safetyDepositReturn}("");
                 require(success2, "ETH transfer to sender failed");
             }
         } else {
             // ERC20 token transfers
             IERC20 token = IERC20(htlc.tokenAddress);
-            token.safeTransfer(htlc.receiver, htlc.amount);
-            if (htlc.safetyDeposit > 0) {
-                token.safeTransfer(htlc.sender, htlc.safetyDeposit);
+            token.safeTransfer(htlc.receiver, actualWithdrawAmount);
+            if (safetyDepositReturn > 0) {
+                token.safeTransfer(htlc.sender, safetyDepositReturn);
             }
         }
-
-        // Emit HTLCWithdraw event - 1inch Fusion+ compatible
-        emit HTLCWithdraw(contractId, preimage);
     }
 
     /**
-     * @dev Refunds funds after timelock expiry
-     * @param contractId Unique identifier of the HTLC
+     * @dev Refunds funds after timelock expiry (supports partial refunds)
      */
     function refund(bytes32 contractId) external nonReentrant {
         HTLCData storage htlc = htlcs[contractId];
         
-        // Contract existence check
+        // Validate refund
+        _validateRefund(htlc);
+
+        uint256 refundAmount = htlc.remainingAmount + htlc.remainingSafetyDeposit;
+        bool isPartial = htlc.status == HTLCStatus.PartiallyFilled;
+
+        // Update status
+        htlc.status = HTLCStatus.Refunded;
+        htlc.remainingAmount = 0;
+        htlc.remainingSafetyDeposit = 0;
+
+        // Execute refund transfer
+        _executeRefundTransfer(htlc, refundAmount);
+
+        emit HTLCRefund(contractId, refundAmount, isPartial);
+    }
+
+    /**
+     * @dev Validates refund conditions
+     */
+    function _validateRefund(HTLCData storage htlc) internal view {
         if (htlc.sender == address(0)) revert ContractNotFound();
-        
-        // Authorization check - only sender can refund
         if (msg.sender != htlc.sender) revert Unauthorized();
-        
-        // Status check
         if (htlc.status == HTLCStatus.Withdrawn) revert AlreadyWithdrawn();
         if (htlc.status == HTLCStatus.Refunded) revert AlreadyRefunded();
-        if (htlc.status != HTLCStatus.Active) revert ContractNotActive();
-        
-        // Timelock check - can only refund after expiry
+        if (htlc.status != HTLCStatus.Active && htlc.status != HTLCStatus.PartiallyFilled) revert ContractNotActive();
         if (block.timestamp < htlc.timelock) revert TimelockNotExpired();
+        if (htlc.remainingAmount == 0 && htlc.remainingSafetyDeposit == 0) revert NoPartialFillsToRefund();
+    }
 
-        // Update status to refunded
-        htlc.status = HTLCStatus.Refunded;
-
-        uint256 totalRefund = htlc.amount + htlc.safetyDeposit;
-
-        // Transfer full amount back to sender
+    /**
+     * @dev Executes refund transfer
+     */
+    function _executeRefundTransfer(HTLCData storage htlc, uint256 refundAmount) internal {
         if (htlc.tokenAddress == address(0)) {
-            // ETH transfer
-            (bool success, ) = payable(htlc.sender).call{value: totalRefund}("");
+            (bool success, ) = payable(htlc.sender).call{value: refundAmount}("");
             require(success, "ETH refund failed");
         } else {
-            // ERC20 token transfer
-            IERC20(htlc.tokenAddress).safeTransfer(htlc.sender, totalRefund);
+            IERC20(htlc.tokenAddress).safeTransfer(htlc.sender, refundAmount);
         }
-
-        // Emit HTLCRefund event - 1inch Fusion+ compatible
-        emit HTLCRefund(contractId);
     }
 
     /**
      * @dev Gets HTLC data by contract ID
-     * @param contractId Unique identifier of the HTLC
-     * @return HTLCData struct containing all HTLC information
      */
     function getHTLC(bytes32 contractId) external view returns (HTLCData memory) {
         HTLCData memory htlc = htlcs[contractId];
@@ -279,8 +424,6 @@ contract HTLC is ReentrancyGuard {
 
     /**
      * @dev Checks if contract exists
-     * @param contractId Unique identifier of the HTLC
-     * @return bool indicating if contract exists
      */
     function contractExists(bytes32 contractId) external view returns (bool) {
         return htlcs[contractId].sender != address(0);
@@ -288,8 +431,6 @@ contract HTLC is ReentrancyGuard {
 
     /**
      * @dev Gets contract status
-     * @param contractId Unique identifier of the HTLC
-     * @return HTLCStatus enum value
      */
     function getStatus(bytes32 contractId) external view returns (HTLCStatus) {
         HTLCData memory htlc = htlcs[contractId];
@@ -298,15 +439,25 @@ contract HTLC is ReentrancyGuard {
     }
 
     /**
+     * @dev Gets remaining amount for partial fills
+     */
+    function getRemainingAmount(bytes32 contractId) external view returns (uint256) {
+        HTLCData memory htlc = htlcs[contractId];
+        if (htlc.sender == address(0)) revert ContractNotFound();
+        return htlc.remainingAmount;
+    }
+
+    /**
+     * @dev Gets filled amount for partial fills
+     */
+    function getFilledAmount(bytes32 contractId) external view returns (uint256) {
+        HTLCData memory htlc = htlcs[contractId];
+        if (htlc.sender == address(0)) revert ContractNotFound();
+        return htlc.filledAmount;
+    }
+
+    /**
      * @dev Generates contract ID matching Stellar HTLC pattern
-     * @dev keccak256(abi.encodePacked(sender, receiver, amount, hashlock, timelock, timestamp))
-     * @param sender Address creating the HTLC
-     * @param receiver Address that can withdraw funds
-     * @param amount Amount of tokens/ETH to lock
-     * @param hashlock SHA256 hash of the secret
-     * @param timelock Unix timestamp when refund becomes available
-     * @param timestamp Block timestamp when HTLC was created
-     * @return bytes32 Unique contract identifier
      */
     function generateContractId(
         address sender,
@@ -328,8 +479,6 @@ contract HTLC is ReentrancyGuard {
 
     /**
      * @dev Emergency function to check contract balance
-     * @param tokenAddress Token address (address(0) for ETH)
-     * @return uint256 Contract balance
      */
     function getContractBalance(address tokenAddress) external view returns (uint256) {
         if (tokenAddress == address(0)) {
@@ -341,8 +490,6 @@ contract HTLC is ReentrancyGuard {
 
     /**
      * @dev Helper function to create hashlock from secret
-     * @param secret The secret string or bytes
-     * @return bytes32 SHA256 hash of the secret
      */
     function createHashlock(bytes32 secret) external pure returns (bytes32) {
         return sha256(abi.encodePacked(secret));
@@ -350,11 +497,39 @@ contract HTLC is ReentrancyGuard {
 
     /**
      * @dev Helper function to verify preimage against hashlock
-     * @param preimage The secret to verify
-     * @param hashlock The expected hash
-     * @return bool True if preimage is valid
      */
     function verifyPreimage(bytes32 preimage, bytes32 hashlock) external pure returns (bool) {
         return sha256(abi.encodePacked(preimage)) == hashlock;
+    }
+
+    /**
+     * @dev Batch create multiple HTLCs for gas efficiency
+     */
+    function batchCreateHTLC(
+        HTLCCreationParams[] calldata params
+    ) external payable nonReentrant returns (bytes32[] memory contractIds) {
+        contractIds = new bytes32[](params.length);
+        
+        // Validate total ETH if needed
+        _validateBatchEthRequirement(params);
+        
+        for (uint256 i = 0; i < params.length; i++) {
+            contractIds[i] = _createHTLCInternal(params[i]);
+        }
+    }
+
+    /**
+     * @dev Validates ETH requirement for batch creation
+     */
+    function _validateBatchEthRequirement(HTLCCreationParams[] calldata params) internal view {
+        uint256 totalEthRequired = 0;
+        
+        for (uint256 i = 0; i < params.length; i++) {
+            if (params[i].tokenAddress == address(0)) {
+                totalEthRequired += params[i].amount + params[i].safetyDeposit;
+            }
+        }
+        
+        if (totalEthRequired != msg.value) revert InsufficientBalance();
     }
 }
