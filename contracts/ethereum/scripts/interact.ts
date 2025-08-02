@@ -1,24 +1,20 @@
 import { ethers } from "hardhat";
-
+import { HTLC } from "../typechain-types";
 
 // Replace with your deployed contract address
 const CONTRACT_ADDRESS = "0x..."; // Update after deployment
 
-
 async function main() {
   console.log("Interacting with HTLC contract...");
-
 
   // Get signers
   const [sender, receiver] = await ethers.getSigners();
   console.log("Sender address:", sender.address);
   console.log("Receiver address:", receiver.address);
 
-
-  // Connect to deployed contract
-  const HTLC = await ethers.getContractFactory("HTLC");
-  const htlc = HTLC.attach(CONTRACT_ADDRESS);
-
+  // Connect to deployed contract with proper typing
+  const HTLCFactory = await ethers.getContractFactory("HTLC");
+  const htlc = HTLCFactory.attach(CONTRACT_ADDRESS) as HTLC;
 
   // Example: Create HTLC
   const secret = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
@@ -27,13 +23,11 @@ async function main() {
   const safetyDeposit = ethers.parseEther("0.001"); // 0.001 ETH
   const timelock = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
 
-
   console.log("\nCreating HTLC...");
   console.log("Amount:", ethers.formatEther(amount), "ETH");
   console.log("Safety Deposit:", ethers.formatEther(safetyDeposit), "ETH");
   console.log("Hashlock:", hashlock);
   console.log("Timelock:", new Date(timelock * 1000).toISOString());
-
 
   try {
     const tx = await htlc.connect(sender).createHTLC(
@@ -43,31 +37,29 @@ async function main() {
       hashlock,
       timelock,
       safetyDeposit,
+      false, // allowPartialFills
+      ethers.parseEther("0"), // minFillAmount (0 for no minimum)
       { value: amount + safetyDeposit }
     );
-
 
     console.log("Transaction hash:", tx.hash);
     const receipt = await tx.wait();
     console.log("Transaction confirmed in block:", receipt?.blockNumber);
 
-
-    // Get contract ID from event
-    const event = receipt?.logs.find(log => {
+    // Get contract ID from event with proper typing
+    const event = receipt?.logs.find((log: any) => {
       try {
-        const parsed = htlc.interface.parseLog(log as any);
+        const parsed = htlc.interface.parseLog(log);
         return parsed?.name === "HTLCNew";
       } catch {
         return false;
       }
     });
 
-
     if (event) {
-      const parsed = htlc.interface.parseLog(event as any);
+      const parsed = htlc.interface.parseLog(event);
       const contractId = parsed?.args[0];
       console.log("Contract ID:", contractId);
-
 
       // Get HTLC data
       const htlcData = await htlc.getHTLC(contractId);
@@ -79,7 +71,6 @@ async function main() {
       console.log("- Status:", htlcData.status === 0n ? "Active" : htlcData.status === 1n ? "Withdrawn" : "Refunded");
       console.log("- Timelock:", new Date(Number(htlcData.timelock) * 1000).toISOString());
 
-
       // Example: Withdraw (uncomment to test)
       /*
       console.log("\nWithdrawing HTLC...");
@@ -89,7 +80,6 @@ async function main() {
       console.log("Withdrawal successful!");
       */
 
-
       // Example: Check status after withdrawal
       /*
       const finalStatus = await htlc.getStatus(contractId);
@@ -97,12 +87,10 @@ async function main() {
       */
     }
 
-
   } catch (error) {
     console.error("Error:", error);
   }
 }
-
 
 main()
   .then(() => process.exit(0))
@@ -110,4 +98,3 @@ main()
     console.error(error);
     process.exit(1);
   });
-
