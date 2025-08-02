@@ -1,20 +1,15 @@
-//crosschain/contracts/stellar/stellar-htlc/contracts/htlc/src/lib.rs
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, xdr::ToXdr,
-    Address, Bytes, BytesN, Env, String, Symbol, 
+    contract, contractimpl, contracttype, token, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
 };
-use soroban_sdk::token::TokenClient;
-
-const NATIVE_TOKEN: Symbol = symbol_short!("NATIVE");
 
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
-    HTLCData(BytesN<32>), // Maps contract_id to HTLCData
+    HTLCData(BytesN<32>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum HTLCStatus {
     Active,
@@ -38,37 +33,18 @@ pub struct HTLCData {
     pub locked: bool,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[contracttype]
-pub enum HTLCError {
-    ContractAlreadyExists = 1,
-    ContractNotFound = 2,
-    InvalidPreimage = 3,
-    TimelockNotExpired = 4,
-    TimelockExpired = 5,
-    Unauthorized = 6,
-    InsufficientBalance = 7,
-    ReentrancyDetected = 8,
-    HashComputationFailed = 9,
-    InvalidAmount = 10,
-    InvalidTimelock = 11,
-    ContractNotActive = 12,
-    AlreadyWithdrawn = 13,
-    AlreadyRefunded = 14,
-}
-
 #[contract]
 pub struct HTLCContract;
 
 #[contractimpl]
 impl HTLCContract {
-    /// Creates a new HTLC with XLM
-    /// Following 1inch Fusion+ pattern with safety deposit
+    /// Creates a new HTLC
     pub fn create_htlc(
         env: Env,
         sender: Address,
         receiver: Address,
         amount: i128,
+        token_address: Address,
         hashlock: BytesN<32>,
         timelock: u64,
         safety_deposit: i128,
@@ -90,7 +66,7 @@ impl HTLCContract {
             panic!("Invalid timelock");
         }
 
-        // Generate Keccak-256 contract ID matching Ethereum pattern
+        // Generate contract ID
         let contract_id = Self::generate_contract_id(
             &env,
             &sender,
@@ -110,20 +86,14 @@ impl HTLCContract {
             panic!("Contract already exists");
         }
 
-        // Total amount to lock (amount + safety deposit)
-        let total_amount = amount + safety_deposit;
+        // Transfer tokens from sender to contract
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&sender, &env.current_contract_address(), &amount);
 
-        // Check sender balance
-        let sender_balance = Self::get_native_balance(&env, &sender);
-        if sender_balance < total_amount {
-            panic!("Insufficient balance");
+        // Transfer safety deposit if required
+        if safety_deposit > 0 {
+            token_client.transfer(&sender, &env.current_contract_address(), &safety_deposit);
         }
-
-        // Get native XLM token address and transfer funds to contract
-        let native_token_address = Self::get_native_token_address(&env);
-        let contract_address = env.current_contract_address();
-        let native_token = TokenClient::new(&env, &native_token_address);
-        native_token.transfer(&sender, &contract_address, &total_amount);
 
         // Create HTLC data
         let htlc_data = HTLCData {
@@ -131,7 +101,7 @@ impl HTLCContract {
             sender: sender.clone(),
             receiver: receiver.clone(),
             amount,
-            token_address: native_token_address.clone(),
+            token_address: token_address.clone(),
             hashlock: hashlock.clone(),
             timelock,
             timestamp: current_timestamp,
@@ -147,19 +117,8 @@ impl HTLCContract {
 
         // Emit HTLCNew event - 1inch Fusion+ compatible
         env.events().publish(
-            (
-                Symbol::new(&env, "HTLCNew"),
-                contract_id.clone(),
-            ),
-            (
-                sender.clone(),
-                receiver.clone(),
-                amount,
-                htlc_data.token_address.clone(),
-                hashlock.clone(),
-                timelock,
-                safety_deposit,
-            ),
+            (Symbol::new(&env, "HTLCNew"), contract_id.clone()),
+            (sender, receiver, amount, hashlock, timelock, safety_deposit),
         );
 
         contract_id
@@ -204,18 +163,18 @@ impl HTLCContract {
             .persistent()
             .set(&DataKey::HTLCData(contract_id.clone()), &htlc_data);
 
-        // Transfer amount to receiver and safety deposit to sender
-        let contract_address = env.current_contract_address();
-        let native_token_address = Self::get_native_token_address(&env);
-        let native_token = TokenClient::new(&env, &native_token_address);
+        // Transfer tokens to receiver
+        let token_client = token::Client::new(&env, &htlc_data.token_address);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &htlc_data.receiver,
+            &htlc_data.amount,
+        );
 
-        // Transfer main amount to receiver
-        native_token.transfer(&contract_address, &htlc_data.receiver, &htlc_data.amount);
-
-        // Transfer safety deposit back to sender
+        // Return safety deposit to sender if applicable
         if htlc_data.safety_deposit > 0 {
-            native_token.transfer(
-                &contract_address,
+            token_client.transfer(
+                &env.current_contract_address(),
                 &htlc_data.sender,
                 &htlc_data.safety_deposit,
             );
@@ -230,10 +189,7 @@ impl HTLCContract {
 
         // Emit HTLCWithdraw event - 1inch Fusion+ compatible
         env.events().publish(
-            (
-                Symbol::new(&env, "HTLCWithdraw"),
-                contract_id.clone(),
-            ),
+            (Symbol::new(&env, "HTLCWithdraw"), contract_id.clone()),
             preimage,
         );
     }
@@ -269,16 +225,22 @@ impl HTLCContract {
             .persistent()
             .set(&DataKey::HTLCData(contract_id.clone()), &htlc_data);
 
-        // Transfer full amount (amount + safety deposit) back to sender
-        let contract_address = env.current_contract_address();
-        let native_token_address = Self::get_native_token_address(&env);
-        let total_refund = htlc_data.amount + htlc_data.safety_deposit;
-
-        TokenClient::new(&env, &native_token_address).transfer(
-            &contract_address,
+        // Transfer tokens back to sender
+        let token_client = token::Client::new(&env, &htlc_data.token_address);
+        token_client.transfer(
+            &env.current_contract_address(),
             &htlc_data.sender,
-            &total_refund,
+            &htlc_data.amount,
         );
+
+        // Transfer safety deposit back to sender
+        if htlc_data.safety_deposit > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &htlc_data.sender,
+                &htlc_data.safety_deposit,
+            );
+        }
 
         // Update status to refunded
         htlc_data.status = HTLCStatus::Refunded;
@@ -313,7 +275,6 @@ impl HTLCContract {
     }
 
     // Private helper functions
-
     fn get_htlc_data(env: &Env, contract_id: &BytesN<32>) -> HTLCData {
         env.storage()
             .persistent()
@@ -321,21 +282,7 @@ impl HTLCContract {
             .unwrap_or_else(|| panic!("Contract not found"))
     }
 
-    fn get_native_balance(env: &Env, address: &Address) -> i128 {
-        let native_token_address = Self::get_native_token_address(env);
-        TokenClient::new(env, &native_token_address).balance(address)
-    }
-
-    /// Gets the proper native XLM Stellar Asset Contract address
-    fn get_native_token_address(env: &Env) -> Address {
-        // For testing purposes, create a consistent address
-        // In production, this would be the actual Stellar Asset Contract address for native XLM
-        let addr_str = String::from_str(env, "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQAHRBBI6ZFO");
-        Address::from_string(&addr_str)
-    }
-
     /// Generates Keccak-256 contract ID matching Ethereum HTLC pattern
-    /// keccak256(abi.encodePacked(sender, receiver, amount, hashlock, timelock, timestamp))
     fn generate_contract_id(
         env: &Env,
         sender: &Address,
@@ -345,14 +292,13 @@ impl HTLCContract {
         timelock: u64,
         timestamp: u64,
     ) -> BytesN<32> {
-        // More efficient packing without XDR for better cross-chain compatibility
         let mut packed_data = Bytes::new(env);
 
-        // Convert addresses to bytes - use consistent 32-byte representation
+        // Convert addresses to bytes for cross-chain compatibility
         let sender_bytes = Self::address_to_bytes32(env, sender);
         let receiver_bytes = Self::address_to_bytes32(env, receiver);
 
-        // Pack data in the same order as Ethereum ABI encoding
+        // Pack data in Ethereum ABI encoding order
         packed_data.extend_from_slice(&sender_bytes.to_array());
         packed_data.extend_from_slice(&receiver_bytes.to_array());
         packed_data.extend_from_slice(&amount.to_be_bytes());
@@ -360,17 +306,14 @@ impl HTLCContract {
         packed_data.extend_from_slice(&timelock.to_be_bytes());
         packed_data.extend_from_slice(&timestamp.to_be_bytes());
 
-        // Generate Keccak-256 hash
+        // Generate Keccak-256 hash for Ethereum compatibility
         env.crypto().keccak256(&packed_data).into()
     }
 
-    /// Converts Stellar address to consistent 32-byte representation for cross-chain compatibility
+    /// Converts Stellar address to consistent 32-byte representation
     fn address_to_bytes32(env: &Env, address: &Address) -> BytesN<32> {
-        // Create consistent 32-byte representation from address
         let address_bytes = address.to_xdr(env);
         let hash = env.crypto().sha256(&address_bytes);
         hash.into()
     }
 }
-
-mod test;

@@ -6,7 +6,6 @@ rust-version = "1.74"
 authors = ["CrossChain 1inch Team"]
 description = "Production-ready Stellar Soroban HTLC contract for cross-chain atomic swaps"
 license = "MIT"
-repository = "https://github.com/crosschain-1inch/stellar-htlc"
 keywords = ["stellar", "soroban", "htlc", "atomic-swap", "cross-chain"]
 categories = ["cryptography", "blockchain"]
 
@@ -14,10 +13,10 @@ categories = ["cryptography", "blockchain"]
 crate-type = ["cdylib"]
 
 [dependencies]
-soroban-sdk = "21.7.7"
+soroban-sdk = "20.0.0"
 
 [dev-dependencies]
-soroban-sdk = { version = "21.7.7", features = ["testutils"] }
+soroban-sdk = { version = "20.0.0", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
