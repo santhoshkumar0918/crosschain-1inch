@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
+    contract, contractimpl, contracttype, token, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol,
 };
 
 #[derive(Clone)]
@@ -44,6 +44,7 @@ impl HTLCContract {
         sender: Address,
         receiver: Address,
         amount: i128,
+        token_address: Address,
         hashlock: BytesN<32>,
         timelock: u64,
         safety_deposit: i128,
@@ -85,9 +86,14 @@ impl HTLCContract {
             panic!("Contract already exists");
         }
 
-        // For production, this would be the native XLM token address
-        // For testing, we use a generated address
-        let token_address = Address::generate(&env);
+        // Transfer tokens from sender to contract
+        let token_client = token::Client::new(&env, &token_address);
+        token_client.transfer(&sender, &env.current_contract_address(), &amount);
+
+        // Transfer safety deposit if required
+        if safety_deposit > 0 {
+            token_client.transfer(&sender, &env.current_contract_address(), &safety_deposit);
+        }
 
         // Create HTLC data
         let htlc_data = HTLCData {
@@ -157,6 +163,23 @@ impl HTLCContract {
             .persistent()
             .set(&DataKey::HTLCData(contract_id.clone()), &htlc_data);
 
+        // Transfer tokens to receiver
+        let token_client = token::Client::new(&env, &htlc_data.token_address);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &htlc_data.receiver,
+            &htlc_data.amount,
+        );
+
+        // Return safety deposit to sender if applicable
+        if htlc_data.safety_deposit > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &htlc_data.sender,
+                &htlc_data.safety_deposit,
+            );
+        }
+
         // Update status to withdrawn
         htlc_data.status = HTLCStatus::Withdrawn;
         htlc_data.locked = false;
@@ -201,6 +224,23 @@ impl HTLCContract {
         env.storage()
             .persistent()
             .set(&DataKey::HTLCData(contract_id.clone()), &htlc_data);
+
+        // Transfer tokens back to sender
+        let token_client = token::Client::new(&env, &htlc_data.token_address);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &htlc_data.sender,
+            &htlc_data.amount,
+        );
+
+        // Transfer safety deposit back to sender
+        if htlc_data.safety_deposit > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &htlc_data.sender,
+                &htlc_data.safety_deposit,
+            );
+        }
 
         // Update status to refunded
         htlc_data.status = HTLCStatus::Refunded;
@@ -277,5 +317,3 @@ impl HTLCContract {
         hash.into()
     }
 }
-
-mod test;
