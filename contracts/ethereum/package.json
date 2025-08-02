@@ -1,7 +1,21 @@
 {
-  "name": "hardhat-project",
+  "name": "ethereum-htlc",
+  "version": "1.0.0",
+  "description": "Ethereum HTLC contract for cross-chain atomic swaps with Stellar",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:sepolia": "hardhat run scripts/deploy.ts --network sepolia",
+    "verify:sepolia": "hardhat verify --network sepolia"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.4.0"
+  },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@nomicfoundation/hardhat-verify": "^2.1.0",
+    "dotenv": "^16.6.1",
     "hardhat": "^2.26.1"
   }
 }
+
