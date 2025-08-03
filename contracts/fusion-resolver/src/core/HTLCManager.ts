@@ -24,15 +24,15 @@ export class HTLCManager {
   private logger = new Logger("HTLCManager");
   private htlcMappings = new Map<string, HTLCPair>();
 
-  // Simplified HTLC ABI (include your full ABI here)
+  // Updated HTLC ABI to match the deployed contract
   private readonly HTLC_ABI = [
-    "function createHTLC(address sender, address receiver, uint256 amount, address tokenAddress, bytes32 hashlock, uint256 timelock, uint256 safetyDeposit) external payable returns (bytes32)",
-    "function withdraw(bytes32 contractId, bytes32 preimage) external",
+    "function createHTLC(address receiver, uint256 amount, address tokenAddress, bytes32 hashlock, uint256 timelock, uint256 safetyDeposit, bool allowPartialFills, uint256 minFillAmount) external payable returns (bytes32)",
+    "function withdraw(bytes32 contractId, bytes32 preimage, uint256 withdrawAmount) external",
     "function refund(bytes32 contractId) external",
-    "function getHTLC(bytes32 contractId) external view returns (tuple(bytes32,address,address,uint256,address,bytes32,uint256,uint256,uint256,uint8))",
-    "event HTLCNew(bytes32 indexed contractId, address indexed sender, address indexed receiver, uint256 amount, address tokenAddress, bytes32 hashlock, uint256 timelock, uint256 safetyDeposit)",
-    "event HTLCWithdraw(bytes32 indexed contractId, bytes32 preimage)",
-    "event HTLCRefund(bytes32 indexed contractId)",
+    "function getHTLC(bytes32 contractId) external view returns (tuple(bytes32,address,address,uint256,uint256,uint256,address,bytes32,uint256,uint256,uint256,uint256,uint8,bool,uint256))",
+    "event HTLCNew(bytes32 indexed contractId, address indexed sender, address indexed receiver, uint256 amount, address tokenAddress, bytes32 hashlock, uint256 timelock, uint256 safetyDeposit, bool allowPartialFills, uint256 minFillAmount)",
+    "event HTLCWithdraw(bytes32 indexed contractId, bytes32 preimage, uint256 withdrawAmount, bool isPartial)",
+    "event HTLCRefund(bytes32 indexed contractId, uint256 refundAmount, bool isPartial)",
   ];
 
   constructor() {
@@ -49,7 +49,9 @@ export class HTLCManager {
     );
 
     // Initialize Stellar connection
-    this.stellarServer = new Horizon.Server(config.stellar.rpcUrl);
+    this.stellarServer = new Horizon.Server(
+      "https://horizon-testnet.stellar.org"
+    );
     this.stellarKeypair = Keypair.fromSecret(config.resolver.stellarSecret);
 
     this.logger.info("HTLC Manager initialized", {
@@ -80,12 +82,12 @@ export class HTLCManager {
 
       // Determine swap direction and create HTLCs
       if (params.order.srcChainId === config.ethereum.chainId) {
-        // ETH → Stellar swap
+        // ETH → Stellar swap: User sends ETH, resolver provides XLM
         ethereumContractId = await this.createEthereumHTLC({
           sender: params.resolver,
           receiver: params.order.maker,
-          amount: params.order.takingAmount,
-          tokenAddress: params.order.takerAsset,
+          amount: params.order.makingAmount, // ETH amount
+          tokenAddress: ethers.ZeroAddress, // Native ETH
           hashlock,
           timelock,
         });
@@ -93,17 +95,17 @@ export class HTLCManager {
         stellarContractId = await this.createStellarHTLC({
           sender: params.resolver,
           receiver: params.order.maker,
-          amount: params.order.makingAmount,
+          amount: params.order.takingAmount, // XLM amount
           assetCode: "native", // XLM
           hashlock,
           timelock,
         });
       } else {
-        // Stellar → ETH swap
+        // Stellar → ETH swap: User sends XLM, resolver provides ETH
         stellarContractId = await this.createStellarHTLC({
           sender: params.resolver,
           receiver: params.order.maker,
-          amount: params.order.takingAmount,
+          amount: params.order.makingAmount, // XLM amount
           assetCode: "native",
           hashlock,
           timelock,
@@ -112,8 +114,8 @@ export class HTLCManager {
         ethereumContractId = await this.createEthereumHTLC({
           sender: params.resolver,
           receiver: params.order.maker,
-          amount: params.order.makingAmount,
-          tokenAddress: params.order.makerAsset,
+          amount: params.order.takingAmount, // ETH amount
+          tokenAddress: ethers.ZeroAddress, // Native ETH
           hashlock,
           timelock,
         });
@@ -159,15 +161,16 @@ export class HTLCManager {
       // Calculate safety deposit (10% of amount)
       const safetyDeposit = (BigInt(params.amount) * BigInt(10)) / BigInt(100);
 
-      // Prepare transaction
+      // Prepare transaction with correct parameters for the deployed contract
       const tx = await this.ethHTLCContract.createHTLC(
-        params.sender,
-        params.receiver,
+        params.receiver, // receiver (not sender first!)
         params.amount,
         params.tokenAddress,
         params.hashlock,
         params.timelock,
         safetyDeposit.toString(),
+        false, // allowPartialFills
+        "0", // minFillAmount
         {
           value:
             params.tokenAddress === ethers.ZeroAddress
@@ -236,9 +239,30 @@ export class HTLCManager {
     this.logger.info("Creating Stellar HTLC", params);
 
     try {
-      const account = await this.stellarServer.loadAccount(
-        this.stellarKeypair.publicKey()
-      );
+      // Check if resolver account exists, if not create/fund it
+      let account;
+      try {
+        account = await this.stellarServer.loadAccount(
+          this.stellarKeypair.publicKey()
+        );
+        this.logger.info("Stellar resolver account found", {
+          address: this.stellarKeypair.publicKey(),
+          balance: account.balances[0]?.balance,
+        });
+      } catch (error) {
+        this.logger.warn(
+          "Stellar resolver account not found, this might be the issue",
+          {
+            address: this.stellarKeypair.publicKey(),
+            error: error instanceof Error ? error.message : "Unknown error",
+          }
+        );
+
+        // For now, throw a more descriptive error
+        throw new Error(
+          `Stellar resolver account not found: ${this.stellarKeypair.publicKey()}. Please fund this account on Stellar testnet.`
+        );
+      }
 
       // Calculate safety deposit (10% of amount)
       const safetyDeposit = (BigInt(params.amount) * BigInt(10)) / BigInt(100);
@@ -246,13 +270,27 @@ export class HTLCManager {
       // Convert parameters to Stellar ScVal format
       const senderAddr = Address.fromString(params.sender);
       const receiverAddr = Address.fromString(params.receiver);
-      const amountScVal = nativeToScVal(params.amount, { type: "i128" });
-      const tokenAddr = Address.fromString(config.resolver.stellarAddress); // Use native XLM
-      const hashlockScVal = nativeToScVal(params.hashlock, { type: "bytes" });
-      const timelockScVal = nativeToScVal(params.timelock, { type: "u64" });
-      const safetyDepositScVal = nativeToScVal(safetyDeposit.toString(), {
+      const amountScVal = nativeToScVal(BigInt(params.amount), {
         type: "i128",
       });
+
+      // For native XLM, we need to use the native token contract address
+      // This should be the Stellar Asset Contract (SAC) address for native XLM
+      const nativeTokenAddress =
+        "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQAHHAGCN4B2"; // Native XLM SAC address
+      const tokenAddr = Address.fromString(nativeTokenAddress);
+
+      const hashlockScVal = nativeToScVal(
+        Buffer.from(params.hashlock.slice(2), "hex"),
+        { type: "bytes" }
+      );
+      const timelockScVal = nativeToScVal(params.timelock, { type: "u64" });
+      const safetyDepositScVal = nativeToScVal(
+        BigInt(safetyDeposit.toString()),
+        {
+          type: "i128",
+        }
+      );
 
       // Build transaction
       const contract = new Contract(config.stellar.htlcContractId);

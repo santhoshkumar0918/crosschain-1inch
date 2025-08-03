@@ -110,3 +110,6 @@ export interface CreateOrderParams {
   timelock?: number;
   secretHashes?: string[];
 }
+
+// Export liquidity management types
+export * from "./liquidity";

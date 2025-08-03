@@ -1,0 +1,178 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.QuoteCalculator = void 0;
+const logger_1 = require("../utils/logger");
+const config_1 = require("../utils/config");
+class QuoteCalculator {
+    logger = new logger_1.Logger("QuoteCalculator");
+    // Mock price data - in production, integrate with real oracles
+    mockPrices = {
+        ETH: 2000, // $2000 per ETH
+        XLM: 0.12, // $0.12 per XLM
+        USDC: 1.0, // $1.00 per USDC
+        USDT: 1.0, // $1.00 per USDT
+    };
+    async calculateQuote(request) {
+        this.logger.info("Calculating quote", { request });
+        try {
+            // Get asset symbols
+            const srcSymbol = this.getAssetSymbol(request.srcToken);
+            const dstSymbol = this.getAssetSymbol(request.dstToken);
+            // Get prices
+            const srcPrice = this.mockPrices[srcSymbol] || 1;
+            const dstPrice = this.mockPrices[dstSymbol] || 1;
+            const exchangeRate = srcPrice / dstPrice;
+            // Calculate amounts
+            const srcAmount = request.amount;
+            const slippage = request.slippage || config_1.config.auction.maxSlippage;
+            const dstAmountBeforeSlippage = this.calculateOutputAmount(srcAmount, exchangeRate);
+            const dstAmount = this.applySlippage(dstAmountBeforeSlippage, slippage);
+            // Calculate price impact
+            const priceImpact = this.calculatePriceImpact(srcAmount, srcSymbol);
+            // Estimate gas costs
+            const gasEstimate = await this.estimateGasCosts(request);
+            // Create swap route
+            const route = this.buildSwapRoute(request, srcAmount, dstAmount);
+            const quote = {
+                srcAmount,
+                dstAmount,
+                price: exchangeRate.toString(),
+                priceImpact: priceImpact.toString(),
+                gasEstimate: gasEstimate.toString(),
+                auctionDuration: config_1.config.auction.defaultDuration,
+                estimatedTime: this.estimateSwapTime(request.srcChain, request.dstChain),
+                route,
+            };
+            this.logger.info("Quote calculated successfully", { quote });
+            return quote;
+        }
+        catch (error) {
+            this.logger.error("Failed to calculate quote", error);
+            throw error;
+        }
+    }
+    // Calculate output amount based on exchange rate
+    calculateOutputAmount(inputAmount, exchangeRate) {
+        const inputBigInt = BigInt(inputAmount);
+        // Convert input to human readable format first
+        let inputHuman;
+        let outputRaw;
+        // Determine input token decimals and convert
+        if (exchangeRate > 1) {
+            // ETH -> XLM: input is in wei (18 decimals), output should be in stroops (6 decimals)
+            inputHuman = Number(inputBigInt) / 1e18; // Convert wei to ETH
+            const outputHuman = inputHuman * exchangeRate; // ETH to XLM
+            outputRaw = BigInt(Math.floor(outputHuman * 1e6)); // Convert to stroops
+        }
+        else {
+            // XLM -> ETH: input is in stroops (6 decimals), output should be in wei (18 decimals)
+            inputHuman = Number(inputBigInt) / 1e6; // Convert stroops to XLM
+            const outputHuman = inputHuman * exchangeRate; // XLM to ETH
+            outputRaw = BigInt(Math.floor(outputHuman * 1e18)); // Convert to wei
+        }
+        return outputRaw.toString();
+    }
+    // Apply slippage to amount
+    applySlippage(amount, slippage) {
+        const amountNum = parseFloat(amount);
+        const afterSlippage = amountNum * (1 - slippage);
+        return Math.floor(afterSlippage).toString();
+    }
+    // Calculate price impact based on amount and liquidity
+    calculatePriceImpact(amount, asset) {
+        const amountNum = parseFloat(amount);
+        // Mock liquidity pools
+        const liquidityPools = {
+            ETH: 1000, // 1000 ETH liquidity
+            XLM: 10000000, // 10M XLM liquidity
+            USDC: 2000000, // 2M USDC liquidity
+        };
+        const poolSize = liquidityPools[asset] || 1000000;
+        const impact = (amountNum / poolSize) * 100; // Simple impact model
+        return Math.min(impact, 5.0); // Cap at 5%
+    }
+    // Estimate gas costs for cross-chain swap
+    async estimateGasCosts(request) {
+        let totalGasCost = 0;
+        // Ethereum gas costs
+        if (request.srcChain === config_1.config.ethereum.chainId ||
+            request.dstChain === config_1.config.ethereum.chainId) {
+            const ethGasPrice = 20000000000; // 20 gwei
+            const ethGasLimit = 300000; // HTLC operations
+            totalGasCost += ethGasPrice * ethGasLimit;
+        }
+        // Stellar transaction fees
+        if (request.srcChain === "stellar" || request.dstChain === "stellar") {
+            const stellarFee = 100000; // 0.01 XLM base fee
+            totalGasCost += stellarFee;
+        }
+        return totalGasCost;
+    }
+    // Build swap route information
+    buildSwapRoute(request, srcAmount, dstAmount) {
+        return [
+            {
+                chain: request.srcChain.toString(),
+                protocol: "FusionHTLC",
+                tokenIn: request.srcToken,
+                tokenOut: request.dstToken,
+                amountIn: srcAmount,
+                amountOut: dstAmount,
+            },
+        ];
+    }
+    // Estimate total swap time
+    estimateSwapTime(srcChain, dstChain) {
+        // Base times in seconds
+        const auctionTime = config_1.config.auction.defaultDuration; // Dutch auction
+        const blockConfirmationTime = 30; // Average block confirmation
+        const htlcCreationTime = 60; // HTLC creation on both chains
+        const secretRevealTime = 30; // Secret revelation and completion
+        return (auctionTime + blockConfirmationTime + htlcCreationTime + secretRevealTime);
+    }
+    // Get asset symbol from contract address
+    getAssetSymbol(address) {
+        const addressMap = {
+            [config_1.config.ethereum.htlcAddress]: "ETH",
+            [config_1.config.stellar.htlcContractId]: "XLM",
+            "0xa0b86a33e6e55d1c7b2e8f3d3a9f4c9a8b3f5e6d": "USDC", // Mock USDC
+            "0xd0a1e359811322d97991e03f863a0c30c2cf029c": "USDT", // Mock USDT
+        };
+        return addressMap[address] || "UNKNOWN";
+    }
+    // Get real-time price (mock implementation)
+    async getRealTimePrice(fromAsset, toAsset) {
+        // In production, integrate with:
+        // - Chainlink oracles
+        // - CoinGecko API
+        // - DEX aggregators
+        // - Multiple price sources for accuracy
+        const fromPrice = this.mockPrices[this.getAssetSymbol(fromAsset)] || 1;
+        const toPrice = this.mockPrices[this.getAssetSymbol(toAsset)] || 1;
+        return fromPrice / toPrice;
+    }
+    // Update mock prices (for demo purposes)
+    updateMockPrice(asset, price) {
+        this.mockPrices[asset] = price;
+        this.logger.info("Updated mock price", { asset, price });
+    }
+    // Get supported trading pairs
+    getSupportedPairs() {
+        const assets = Object.keys(this.mockPrices);
+        const pairs = [];
+        for (const from of assets) {
+            for (const to of assets) {
+                if (from !== to) {
+                    pairs.push({
+                        from,
+                        to,
+                        rate: this.mockPrices[from] / this.mockPrices[to],
+                    });
+                }
+            }
+        }
+        return pairs;
+    }
+}
+exports.QuoteCalculator = QuoteCalculator;
+//# sourceMappingURL=QuoteCalculator.js.map
