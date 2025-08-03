@@ -1,7 +1,7 @@
 // contracts/fusion-resolver/src/types/index.ts
-
 export interface FusionOrder {
   orderHash: string;
+  salt: string;
   maker: string;
   receiver: string;
   makerAsset: string;
@@ -10,32 +10,27 @@ export interface FusionOrder {
   takingAmount: string;
   srcChainId: number | string;
   dstChainId: number | string;
-  timelock: number;
-  secretHashes?: string[];
-  status: OrderStatus;
-  createdAt: number;
+  secretHashes: string[];
   auctionStartTime: number;
   auctionEndTime: number;
-  reservePrice?: string;
+  timelock: number;
+  status: OrderStatus;
+  createdAt: number;
+  updatedAt: number;
   currentPrice?: string;
-  metadata?: Record<string, any>;
+  reservePrice?: string;
+  htlcPair?: HTLCPair;
 }
 
-export type OrderStatus =
-  | "pending"
-  | "auction_active"
-  | "htlc_created"
-  | "filled"
-  | "cancelled"
-  | "expired"
-  | "refunded";
-
-export interface AuctionBid {
-  bidder: string;
-  price: string;
-  timestamp: number;
-  htlcAddress: string;
-}
+export type OrderStatus = 
+  | 'pending'
+  | 'active' 
+  | 'auction_active'
+  | 'htlc_created'
+  | 'partially_filled'
+  | 'filled'
+  | 'expired' 
+  | 'cancelled';
 
 export interface HTLCPair {
   ethereumContractId: string;
@@ -43,14 +38,8 @@ export interface HTLCPair {
   secret: string;
   hashlock: string;
   timelock: number;
-  status: HTLCStatus;
+  status: 'pending' | 'both_created' | 'secret_revealed' | 'completed' | 'refunded';
 }
-
-export type HTLCStatus =
-  | "both_created"
-  | "secret_revealed"
-  | "completed"
-  | "refunded";
 
 export interface QuoteRequest {
   srcChain: number | string;
@@ -82,34 +71,17 @@ export interface SwapRoute {
   amountOut: string;
 }
 
-export interface OrderFilters {
-  maker?: string;
-  srcChain?: string | number;
-  dstChain?: string | number;
-  status?: OrderStatus;
+export interface AuctionBid {
+  bidder: string;
+  price: string;
+  timestamp: number;
+  htlcAddress?: string;
 }
 
-export interface OrderStats {
-  total: number;
-  active: number;
-  completed: number;
-  cancelled: number;
-  expired: number;
-  totalVolume: string;
+export interface ResolverConfig {
+  minProfitMargin: number;
+  maxSlippage: number;
+  auctionDuration: number;
+  supportedChains: (number | string)[];
+  supportedTokens: Record<string, string[]>;
 }
-
-export interface CreateOrderParams {
-  maker: string;
-  receiver: string;
-  makerAsset: string;
-  takerAsset: string;
-  makingAmount: string;
-  takingAmount: string;
-  srcChainId: number | string;
-  dstChainId: number | string;
-  timelock?: number;
-  secretHashes?: string[];
-}
-
-// Export liquidity management types
-export * from "./liquidity";
