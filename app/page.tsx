@@ -12,7 +12,7 @@ export default function Home() {
       <div className="container mx-auto px-4 py-8">
         <div className="text-center space-y-4 mb-8">
           <h1 className="text-5xl font-bold tracking-tighter bg-gradient-to-r from-blue-600 via-purple-600 to-blue-600 bg-clip-text text-transparent">
-            Cross-Chain Fusion+
+            StellaSwap
           </h1>
           <p className="text-xl text-muted-foreground max-w-2xl mx-auto">
             The first 1inch Fusion+ extension to Stellar. Enabling atomic swaps
