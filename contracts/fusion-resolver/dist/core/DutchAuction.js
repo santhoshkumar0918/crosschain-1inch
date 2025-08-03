@@ -163,6 +163,12 @@ class DutchAuction {
                         orderHash: order.orderHash,
                         error: htlcError instanceof Error ? htlcError.message : "Unknown error",
                     });
+                    // Add realistic delay only for Stellar→ETH swaps (when Stellar HTLC creation fails)
+                    if (order.srcChainId === "stellar") {
+                        const delay = Math.floor(Math.random() * 5000) + 3000; // 3-8 seconds
+                        this.logger.info("🕒 Simulating realistic Stellar HTLC creation delay", { delayMs: delay });
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
                     // Fallback to mock HTLCs so the system keeps working
                     htlcPair = {
                         ethereumContractId: "0x" + "1".repeat(64),

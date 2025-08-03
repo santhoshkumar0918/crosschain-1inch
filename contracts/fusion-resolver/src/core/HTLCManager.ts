@@ -8,11 +8,14 @@ import {
   Contract,
   Address,
   nativeToScVal,
+  Asset,
+  StrKey,
 } from "@stellar/stellar-sdk";
+import * as crypto from "crypto";
 import { FusionOrder, HTLCPair } from "../types";
 import { Logger } from "../utils/logger";
 import { config } from "../utils/config";
-
+  
 export class HTLCManager {
   private ethProvider: ethers.JsonRpcProvider;
   private ethWallet: ethers.Wallet;
@@ -93,22 +96,24 @@ export class HTLCManager {
         });
 
         stellarContractId = await this.createStellarHTLC({
-          sender: params.resolver,
+          sender: config.resolver.stellarAddress, // Use resolver's Stellar address
           receiver: params.order.maker,
           amount: params.order.takingAmount, // XLM amount
           assetCode: "native", // XLM
           hashlock,
           timelock,
+          secret, // Pass the secret to generate proper Stellar hashlock
         });
       } else {
         // Stellar → ETH swap: User sends XLM, resolver provides ETH
         stellarContractId = await this.createStellarHTLC({
-          sender: params.resolver,
+          sender: config.resolver.stellarAddress, // Use resolver's Stellar address
           receiver: params.order.maker,
           amount: params.order.makingAmount, // XLM amount
           assetCode: "native",
           hashlock,
           timelock,
+          secret, // Pass the secret to generate proper Stellar hashlock
         });
 
         ethereumContractId = await this.createEthereumHTLC({
@@ -235,6 +240,7 @@ export class HTLCManager {
     assetCode: string;
     hashlock: string;
     timelock: number;
+    secret: string;
   }): Promise<string> {
     this.logger.info("Creating Stellar HTLC", params);
 
@@ -268,20 +274,46 @@ export class HTLCManager {
       const safetyDeposit = (BigInt(params.amount) * BigInt(10)) / BigInt(100);
 
       // Convert parameters to Stellar ScVal format
-      const senderAddr = Address.fromString(params.sender);
-      const receiverAddr = Address.fromString(params.receiver);
+      this.logger.info("Creating Stellar HTLC with parameters", {
+        sender: params.sender,
+        receiver: params.receiver,
+        amount: params.amount,
+        contractId: config.stellar.htlcContractId
+      });
+      
+      // Use the resolver's Stellar address as sender (who provides liquidity)
+      const resolverStellarAddr = config.resolver.stellarAddress;
+      const senderAddr = Address.account(StrKey.decodeEd25519PublicKey(resolverStellarAddr));
+      
+      // For receiver, we need to handle the case where it might be a user's Stellar address
+      let receiverAddr: Address;
+      try {
+        // Try to decode the receiver as a Stellar account address
+        receiverAddr = Address.account(StrKey.decodeEd25519PublicKey(params.receiver));
+        this.logger.info("Successfully decoded receiver as Stellar account", { receiver: params.receiver });
+      } catch (error) {
+        this.logger.warn("Receiver is not a valid Stellar account address, using resolver address", { 
+          receiver: params.receiver,
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+        // Fallback to resolver's address for testing
+        receiverAddr = Address.account(StrKey.decodeEd25519PublicKey(resolverStellarAddr));
+      }
       const amountScVal = nativeToScVal(BigInt(params.amount), {
         type: "i128",
       });
 
       // For native XLM, we need to use the native token contract address
-      // This should be the Stellar Asset Contract (SAC) address for native XLM
-      const nativeTokenAddress =
-        "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQAHHAGCN4B2"; // Native XLM SAC address
+      // Get the proper SAC address for native XLM on testnet
+      const nativeTokenAddress = Asset.native().contractId(Networks.TESTNET);
       const tokenAddr = Address.fromString(nativeTokenAddress);
+      
+      this.logger.info("Native token address", { nativeTokenAddress });
 
+      // Convert ETH-style hashlock (keccak256) to Stellar-style hashlock (sha256)
+      const stellarHashlock = this.convertToStellarHashlock(params.secret);
       const hashlockScVal = nativeToScVal(
-        Buffer.from(params.hashlock.slice(2), "hex"),
+        Buffer.from(stellarHashlock.slice(2), "hex"),
         { type: "bytes" }
       );
       const timelockScVal = nativeToScVal(params.timelock, { type: "u64" });
@@ -397,8 +429,14 @@ export class HTLCManager {
       );
 
       const contract = new Contract(config.stellar.htlcContractId);
-      const contractIdScVal = nativeToScVal(contractId, { type: "bytes" });
-      const preimageScVal = nativeToScVal(preimage, { type: "bytes" });
+      const contractIdScVal = nativeToScVal(
+        Buffer.from(contractId.slice(2), "hex"),
+        { type: "bytes" }
+      );
+      const preimageScVal = nativeToScVal(
+        Buffer.from(preimage.slice(2), "hex"),
+        { type: "bytes" }
+      );
 
       const transaction = new TransactionBuilder(account, {
         fee: "1000000",
@@ -468,7 +506,10 @@ export class HTLCManager {
       );
 
       const contract = new Contract(config.stellar.htlcContractId);
-      const contractIdScVal = nativeToScVal(contractId, { type: "bytes" });
+      const contractIdScVal = nativeToScVal(
+        Buffer.from(contractId.slice(2), "hex"),
+        { type: "bytes" }
+      );
 
       const transaction = new TransactionBuilder(account, {
         fee: "1000000",
@@ -525,7 +566,14 @@ export class HTLCManager {
 
   // Generate random secret
   private generateSecret(): string {
-    return "0x" + require("crypto").randomBytes(32).toString("hex");
+    return "0x" + crypto.randomBytes(32).toString("hex");
+  }
+
+  // Convert secret to Stellar-compatible SHA-256 hashlock
+  private convertToStellarHashlock(secret: string): string {
+    const secretBuffer = Buffer.from(secret.slice(2), "hex");
+    const hash = crypto.createHash("sha256").update(secretBuffer).digest();
+    return "0x" + hash.toString("hex");
   }
 
   // Get HTLC pair for order

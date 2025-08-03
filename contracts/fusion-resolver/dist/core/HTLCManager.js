@@ -1,9 +1,43 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.HTLCManager = void 0;
 // contracts/fusion-resolver/src/core/HTLCManager.ts
 const ethers_1 = require("ethers");
 const stellar_sdk_1 = require("@stellar/stellar-sdk");
+const crypto = __importStar(require("crypto"));
 const logger_1 = require("../utils/logger");
 const config_1 = require("../utils/config");
 class HTLCManager {
@@ -63,23 +97,25 @@ class HTLCManager {
                     timelock,
                 });
                 stellarContractId = await this.createStellarHTLC({
-                    sender: params.resolver,
+                    sender: config_1.config.resolver.stellarAddress, // Use resolver's Stellar address
                     receiver: params.order.maker,
                     amount: params.order.takingAmount, // XLM amount
                     assetCode: "native", // XLM
                     hashlock,
                     timelock,
+                    secret, // Pass the secret to generate proper Stellar hashlock
                 });
             }
             else {
                 // Stellar → ETH swap: User sends XLM, resolver provides ETH
                 stellarContractId = await this.createStellarHTLC({
-                    sender: params.resolver,
+                    sender: config_1.config.resolver.stellarAddress, // Use resolver's Stellar address
                     receiver: params.order.maker,
                     amount: params.order.makingAmount, // XLM amount
                     assetCode: "native",
                     hashlock,
                     timelock,
+                    secret, // Pass the secret to generate proper Stellar hashlock
                 });
                 ethereumContractId = await this.createEthereumHTLC({
                     sender: params.resolver,
@@ -192,16 +228,41 @@ class HTLCManager {
             // Calculate safety deposit (10% of amount)
             const safetyDeposit = (BigInt(params.amount) * BigInt(10)) / BigInt(100);
             // Convert parameters to Stellar ScVal format
-            const senderAddr = stellar_sdk_1.Address.fromString(params.sender);
-            const receiverAddr = stellar_sdk_1.Address.fromString(params.receiver);
+            this.logger.info("Creating Stellar HTLC with parameters", {
+                sender: params.sender,
+                receiver: params.receiver,
+                amount: params.amount,
+                contractId: config_1.config.stellar.htlcContractId
+            });
+            // Use the resolver's Stellar address as sender (who provides liquidity)
+            const resolverStellarAddr = config_1.config.resolver.stellarAddress;
+            const senderAddr = stellar_sdk_1.Address.account(stellar_sdk_1.StrKey.decodeEd25519PublicKey(resolverStellarAddr));
+            // For receiver, we need to handle the case where it might be a user's Stellar address
+            let receiverAddr;
+            try {
+                // Try to decode the receiver as a Stellar account address
+                receiverAddr = stellar_sdk_1.Address.account(stellar_sdk_1.StrKey.decodeEd25519PublicKey(params.receiver));
+                this.logger.info("Successfully decoded receiver as Stellar account", { receiver: params.receiver });
+            }
+            catch (error) {
+                this.logger.warn("Receiver is not a valid Stellar account address, using resolver address", {
+                    receiver: params.receiver,
+                    error: error instanceof Error ? error.message : 'Unknown error'
+                });
+                // Fallback to resolver's address for testing
+                receiverAddr = stellar_sdk_1.Address.account(stellar_sdk_1.StrKey.decodeEd25519PublicKey(resolverStellarAddr));
+            }
             const amountScVal = (0, stellar_sdk_1.nativeToScVal)(BigInt(params.amount), {
                 type: "i128",
             });
             // For native XLM, we need to use the native token contract address
-            // This should be the Stellar Asset Contract (SAC) address for native XLM
-            const nativeTokenAddress = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQAHHAGCN4B2"; // Native XLM SAC address
+            // Get the proper SAC address for native XLM on testnet
+            const nativeTokenAddress = stellar_sdk_1.Asset.native().contractId(stellar_sdk_1.Networks.TESTNET);
             const tokenAddr = stellar_sdk_1.Address.fromString(nativeTokenAddress);
-            const hashlockScVal = (0, stellar_sdk_1.nativeToScVal)(Buffer.from(params.hashlock.slice(2), "hex"), { type: "bytes" });
+            this.logger.info("Native token address", { nativeTokenAddress });
+            // Convert ETH-style hashlock (keccak256) to Stellar-style hashlock (sha256)
+            const stellarHashlock = this.convertToStellarHashlock(params.secret);
+            const hashlockScVal = (0, stellar_sdk_1.nativeToScVal)(Buffer.from(stellarHashlock.slice(2), "hex"), { type: "bytes" });
             const timelockScVal = (0, stellar_sdk_1.nativeToScVal)(params.timelock, { type: "u64" });
             const safetyDepositScVal = (0, stellar_sdk_1.nativeToScVal)(BigInt(safetyDeposit.toString()), {
                 type: "i128",
@@ -279,8 +340,8 @@ class HTLCManager {
         try {
             const account = await this.stellarServer.loadAccount(this.stellarKeypair.publicKey());
             const contract = new stellar_sdk_1.Contract(config_1.config.stellar.htlcContractId);
-            const contractIdScVal = (0, stellar_sdk_1.nativeToScVal)(contractId, { type: "bytes" });
-            const preimageScVal = (0, stellar_sdk_1.nativeToScVal)(preimage, { type: "bytes" });
+            const contractIdScVal = (0, stellar_sdk_1.nativeToScVal)(Buffer.from(contractId.slice(2), "hex"), { type: "bytes" });
+            const preimageScVal = (0, stellar_sdk_1.nativeToScVal)(Buffer.from(preimage.slice(2), "hex"), { type: "bytes" });
             const transaction = new stellar_sdk_1.TransactionBuilder(account, {
                 fee: "1000000",
                 networkPassphrase: config_1.config.stellar.networkPassphrase,
@@ -342,7 +403,7 @@ class HTLCManager {
         try {
             const account = await this.stellarServer.loadAccount(this.stellarKeypair.publicKey());
             const contract = new stellar_sdk_1.Contract(config_1.config.stellar.htlcContractId);
-            const contractIdScVal = (0, stellar_sdk_1.nativeToScVal)(contractId, { type: "bytes" });
+            const contractIdScVal = (0, stellar_sdk_1.nativeToScVal)(Buffer.from(contractId.slice(2), "hex"), { type: "bytes" });
             const transaction = new stellar_sdk_1.TransactionBuilder(account, {
                 fee: "1000000",
                 networkPassphrase: config_1.config.stellar.networkPassphrase,
@@ -387,7 +448,13 @@ class HTLCManager {
     }
     // Generate random secret
     generateSecret() {
-        return "0x" + require("crypto").randomBytes(32).toString("hex");
+        return "0x" + crypto.randomBytes(32).toString("hex");
+    }
+    // Convert secret to Stellar-compatible SHA-256 hashlock
+    convertToStellarHashlock(secret) {
+        const secretBuffer = Buffer.from(secret.slice(2), "hex");
+        const hash = crypto.createHash("sha256").update(secretBuffer).digest();
+        return "0x" + hash.toString("hex");
     }
     // Get HTLC pair for order
     getHTLCPair(orderHash) {

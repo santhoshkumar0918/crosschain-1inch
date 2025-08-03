@@ -24,6 +24,7 @@ export declare class HTLCManager {
     getEthereumBalance(): Promise<number>;
     getStellarBalance(): Promise<number>;
     private generateSecret;
+    private convertToStellarHashlock;
     getHTLCPair(orderHash: string): HTLCPair | undefined;
     getActiveHTLCPairs(): Map<string, HTLCPair>;
 }
